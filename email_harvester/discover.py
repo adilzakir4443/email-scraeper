@@ -205,13 +205,17 @@ def _parse_bing_listing(card) -> dict | None:
         return None
 
 
+_BING_MAX_PAGES = 5
+
+
 def _scrape_bing(niche: str, location: str, max_results: int) -> Iterator[dict]:
     """Yield business dicts from Bing Local."""
     pool = get_pool()
     collected = 0
     offset = 0
+    pages_fetched = 0
 
-    while collected < max_results:
+    while collected < max_results and pages_fetched < _BING_MAX_PAGES:
         query = urllib.parse.quote_plus(f"{niche} near {location}")
         url = f"https://www.bing.com/search?q={query}&filters=local_listing%3Atrue&first={offset}"
         logger.info("[Bing] Fetching offset %d: %s", offset, url)
