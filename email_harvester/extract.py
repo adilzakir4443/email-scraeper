@@ -14,9 +14,10 @@ _EMAIL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# "[at]" / "(at)" / " at " etc. obfuscation patterns
+# "[at]" / "(at)" / " at " etc. obfuscation patterns — [dot] is optional
 _AT_RE = re.compile(
-    r"[a-zA-Z0-9._%+\-]+\s*(?:\[at\]|\(at\)|\bat\b)\s*[a-zA-Z0-9.\-]+\s*(?:\[dot\]|\(dot\)|\bdot\b)\s*[a-zA-Z]{2,}",
+    r"[a-zA-Z0-9._%+\-]+\s*(?:\[at\]|\(at\)|\bat\b)\s*[a-zA-Z0-9.\-]+"
+    r"(?:\s*(?:\[dot\]|\(dot\)|\bdot\b)\s*[a-zA-Z]{2,}|\.[a-zA-Z]{2,})",
     re.IGNORECASE,
 )
 

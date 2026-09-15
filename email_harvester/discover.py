@@ -230,7 +230,6 @@ def _scrape_bing(niche: str, location: str, max_results: int) -> Iterator[dict]:
 
         soup = BeautifulSoup(resp.text, "lxml")
 
-        # Bing local pack
         cards = (
             soup.select("div.b_localList li")
             or soup.select("div.b_rs_li")
@@ -251,6 +250,7 @@ def _scrape_bing(niche: str, location: str, max_results: int) -> Iterator[dict]:
                     return
 
         offset += 10
+        pages_fetched += 1
         _politeness_sleep()
 
 
