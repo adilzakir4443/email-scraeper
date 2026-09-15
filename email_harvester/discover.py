@@ -6,7 +6,9 @@ for a given niche + location and inserts all found businesses into SQLite.
 Resumable: already-inserted businesses (same name + source) are skipped.
 """
 
+import json
 import logging
+import os
 import re
 import time
 import random
@@ -175,30 +177,33 @@ def _scrape_yellowpages(niche: str, location: str, max_results: int) -> Iterator
 # ---------------------------------------------------------------------------
 
 def _parse_bing_listing(card) -> dict | None:
+    """
+    Parse a single Bing Maps result card.
+
+    Bing Maps (bing.com/maps) renders its local-business list client-side and
+    embeds each listing's full structured data as JSON in a `data-entity`
+    attribute on `div.b_maglistcard` — no fragile sub-selectors needed.
+    (Bing's classic web-search local pack — div.b_localList / b_title / etc.
+    — no longer returns any structured local-business data at all; it now
+    just serves organic web results, which is why those selectors always
+    matched zero real listings.)
+    """
     try:
-        name_tag = card.select_one("div.b_title h2") or card.select_one(".lc_name")
-        name = name_tag.get_text(strip=True) if name_tag else None
+        raw = card.get("data-entity")
+        if not raw:
+            return None
+        entity = json.loads(raw).get("entity", {})
+
+        name = entity.get("title")
         if not name:
             return None
 
-        website_tag = card.select_one("a.b_offsite") or card.select_one("a[data-tag='LocalResults.Website']")
-        website = website_tag.get("href") if website_tag else None
-
-        phone_tag = card.select_one(".b_phone") or card.select_one(".lc_phone")
-        phone = phone_tag.get_text(strip=True) if phone_tag else None
-
-        addr_tag = card.select_one(".b_address") or card.select_one(".lc_address")
-        address = addr_tag.get_text(strip=True) if addr_tag else None
-
-        cat_tag = card.select_one(".b_category") or card.select_one(".lc_type")
-        category = cat_tag.get_text(strip=True) if cat_tag else None
-
         return {
             "business_name": name,
-            "website_url": website,
-            "phone": phone,
-            "address": address,
-            "category": category,
+            "website_url": entity.get("website"),
+            "phone": entity.get("phone"),
+            "address": entity.get("address"),
+            "category": entity.get("primaryCategoryName"),
         }
     except Exception as exc:
         logger.debug("Bing parse error: %s", exc)
@@ -206,38 +211,44 @@ def _parse_bing_listing(card) -> dict | None:
 
 
 _BING_MAX_PAGES = 5
+_BING_PAGE_SIZE = 20
 
 
 def _scrape_bing(niche: str, location: str, max_results: int) -> Iterator[dict]:
-    """Yield business dicts from Bing Local."""
+    """Yield business dicts from Bing Maps local listings."""
     pool = get_pool()
     collected = 0
-    offset = 0
+    first = 0
     pages_fetched = 0
 
     while collected < max_results and pages_fetched < _BING_MAX_PAGES:
         query = urllib.parse.quote_plus(f"{niche} near {location}")
-        url = f"https://www.bing.com/search?q={query}&filters=local_listing%3Atrue&first={offset}"
-        logger.info("[Bing] Fetching offset %d: %s", offset, url)
+        url = (
+            f"https://www.bing.com/maps/overlaybfpr?q={query}"
+            f"&mapsV10=1&count={_BING_PAGE_SIZE}&first={first}"
+        )
+        logger.info("[Bing] Fetching first=%d: %s", first, url)
 
         proxy = pool.get()
         with _make_client(proxy) as client:
             resp = _fetch_with_retry(client, url)
 
         if resp is None or resp.status_code != 200:
-            logger.warning("[Bing] No valid response at offset %d, stopping.", offset)
+            logger.warning("[Bing] No valid response at first=%d, stopping.", first)
             break
+
+        if os.environ.get("BING_DEBUG_HTML") and pages_fetched == 0:
+            debug_path = os.environ["BING_DEBUG_HTML"]
+            with open(debug_path, "w", encoding="utf-8") as f:
+                f.write(resp.text)
+            logger.info("[Bing] Saved raw response HTML to %s", debug_path)
 
         soup = BeautifulSoup(resp.text, "lxml")
 
-        cards = (
-            soup.select("div.b_localList li")
-            or soup.select("div.b_rs_li")
-            or soup.select("li.b_algo")
-        )
+        cards = soup.select("div.b_maglistcard[data-entity]")
 
         if not cards:
-            logger.info("[Bing] No more local results at offset %d", offset)
+            logger.info("[Bing] No more local results at first=%d", first)
             break
 
         for card in cards:
@@ -249,7 +260,7 @@ def _scrape_bing(niche: str, location: str, max_results: int) -> Iterator[dict]:
                 if collected >= max_results:
                     return
 
-        offset += 10
+        first += _BING_PAGE_SIZE
         pages_fetched += 1
         _politeness_sleep()
 
