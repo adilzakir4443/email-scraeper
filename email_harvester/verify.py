@@ -18,10 +18,7 @@ Resumable: already-verified rows (verified_at IS NOT NULL) are skipped.
 """
 
 import logging
-import re
-import sqlite3
 from datetime import datetime, timezone
-from typing import Optional
 
 import dns.resolver
 import dns.exception
@@ -61,6 +58,18 @@ _RESOLVER = dns.resolver.Resolver()
 _RESOLVER.lifetime = 5.0
 _RESOLVER.timeout = 5.0
 
+# Fallback to well-known public resolvers when the system-configured one
+# can't complete the query. Some routers/ISPs answer normal OS DNS traffic
+# fine but silently drop or fail dnspython's raw queries — observed even for
+# domains as basic as gmail.com, where the system resolver timed out on
+# every single lookup but 8.8.8.8/1.1.1.1 answered instantly. Without this,
+# _mx_lookup would report "error" for every domain on such a network, and
+# no email could ever be verified as acceptable/risky.
+_FALLBACK_RESOLVER = dns.resolver.Resolver(configure=False)
+_FALLBACK_RESOLVER.nameservers = ["8.8.8.8", "1.1.1.1", "8.8.4.4"]
+_FALLBACK_RESOLVER.lifetime = 5.0
+_FALLBACK_RESOLVER.timeout = 5.0
+
 # In-process MX cache to avoid redundant lookups within a run
 _mx_cache: dict[str, str] = {}
 
@@ -93,27 +102,37 @@ def _is_freemail(domain: str) -> bool:
     return domain.lower() in FREEMAIL_DOMAINS
 
 
+def _mx_lookup_with(domain: str, resolver: dns.resolver.Resolver) -> str:
+    """Run a single MX lookup against *resolver*. See _mx_lookup for the
+    meaning of the returned status string."""
+    try:
+        answers = resolver.resolve(domain, "MX")
+        return "acceptable" if answers else "invalid"
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers):
+        return "invalid"
+    except dns.exception.Timeout:
+        logger.debug("DNS timeout for %s", domain)
+        return "error"
+    except Exception as exc:
+        logger.debug("MX lookup error for %s: %s", domain, exc)
+        return "error"
+
+
 def _mx_lookup(domain: str) -> str:
     """
     Check MX records. Returns:
       'acceptable' — valid MX found
       'invalid'    — no MX records (DNS NXDOMAIN, NoAnswer)
-      'error'      — transient DNS error (don't reject permanently)
+      'error'      — DNS lookup failed on both the system resolver and the
+                     public-DNS fallback (don't reject permanently)
     """
     if domain in _mx_cache:
         return _mx_cache[domain]
 
-    try:
-        answers = _RESOLVER.resolve(domain, "MX")
-        status = "acceptable" if answers else "invalid"
-    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers):
-        status = "invalid"
-    except dns.exception.Timeout:
-        logger.debug("DNS timeout for %s", domain)
-        status = "error"
-    except Exception as exc:
-        logger.debug("MX lookup error for %s: %s", domain, exc)
-        status = "error"
+    status = _mx_lookup_with(domain, _RESOLVER)
+    if status == "error":
+        logger.debug("System resolver failed for %s; retrying via public DNS", domain)
+        status = _mx_lookup_with(domain, _FALLBACK_RESOLVER)
 
     _mx_cache[domain] = status
     return status
@@ -179,6 +198,22 @@ def run_verify(db_path: str) -> None:
         freemail = _is_freemail(domain)
         mx = _mx_lookup(domain) if syntax_ok and not disposable else "invalid"
 
+        if mx == "error":
+            # Transient DNS failure — record the check results but leave
+            # verified_at NULL so this row is retried on the next run instead
+            # of permanently defaulting to "acceptable" (a lookup that never
+            # completed is not the same as one that passed).
+            with get_conn(db_path) as conn:
+                conn.execute(
+                    """UPDATE emails
+                       SET syntax_valid=?, is_disposable=?, is_role=?, is_freemail=?,
+                           mx_status=?
+                       WHERE id=?""",
+                    (int(syntax_ok), int(disposable), int(role), int(freemail), mx, email_id),
+                )
+            counts["error"] += 1
+            continue
+
         tier = _compute_tier(
             syntax_valid=syntax_ok,
             is_disposable=disposable,
@@ -200,10 +235,7 @@ def run_verify(db_path: str) -> None:
                 ),
             )
 
-        if tier == "error":
-            counts["error"] += 1
-        else:
-            counts[tier] += 1
+        counts[tier] += 1
 
     logger.info(
         "[VERIFY] DONE — acceptable=%d  risky=%d  invalid=%d  dns_error=%d  total=%d",

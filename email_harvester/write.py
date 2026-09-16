@@ -15,7 +15,6 @@ import csv
 import logging
 import re
 import sqlite3
-import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -286,7 +285,22 @@ def run_write(
 
     out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(str(out_file))
+    try:
+        wb.save(str(out_file))
+    except PermissionError:
+        # Most commonly: the output file is already open in Excel, which
+        # holds an exclusive lock on Windows. All the scraping/verification
+        # work for this run is done and expensive to redo — don't throw it
+        # away over a locked file. Fall back to a timestamped path instead.
+        fallback = out_file.with_name(
+            f"{out_file.stem}_{datetime.now().strftime('%Y%m%d%H%M%S')}{out_file.suffix}"
+        )
+        logger.warning(
+            "[WRITE] %s is locked (likely open in Excel) — saving to %s instead",
+            out_file, fallback,
+        )
+        wb.save(str(fallback))
+        out_file = fallback
 
     logger.info(
         "[WRITE] DONE — wrote %d leads to %s  (suppressed=%d)",

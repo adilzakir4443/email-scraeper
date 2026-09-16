@@ -14,7 +14,6 @@ Politeness: 3–8s random delay between sites; 2–3 concurrent workers (sync he
 import logging
 import random
 import re
-import sqlite3
 import time
 import urllib.parse
 from typing import Optional

@@ -57,8 +57,16 @@ def init_db(db_path: str) -> None:
     """Create tables if they don't exist. Safe to call on every run."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         conn.executescript(SCHEMA)
+        conn.commit()
+    finally:
+        # sqlite3.Connection's context-manager protocol only commits/rolls
+        # back on exit — it does not close the connection. Without an
+        # explicit close(), this connection (and its WAL file lock) leaks
+        # for the life of the process.
+        conn.close()
     logger.info("Database initialised at %s", db_path)
 
 

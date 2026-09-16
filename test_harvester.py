@@ -14,15 +14,44 @@ Tests for the Bing scraper and obfuscated-email regex fixes:
 3. email_harvester.extract._AT_RE required a "[dot]"/"(dot)"/"dot" separator
    before the TLD, so obfuscated addresses like "name at example.com"
    (obfuscated "at", plain "." before the TLD) were missed.
+4. email_harvester.extract._skip did an exact-match against _SKIP_DOMAINS, so
+   Sentry DSN keys shaped like emails (e.g. "<hex>@sentry.wixpress.com",
+   embedded by Wix sites) slipped through even though "wixpress.com" was
+   already on the skip list — the subdomain never matched exactly. Fixed to
+   match the domain or any subdomain of a skipped entry. Also added
+   "domain.com"/"yourdomain.com" (common hardcoded form placeholders like
+   "user@domain.com") to the skip list.
+5. email_harvester.verify._compute_tier had no branch for mx_status=="error"
+   (a DNS timeout/failure), so it fell through to "acceptable" — and because
+   verified_at got stamped regardless, a transient DNS error permanently
+   misclassified the email as verified-good. Fixed so run_verify leaves
+   verified_at NULL on an MX error, so the row is retried on the next run.
+6. email_harvester.verify._mx_lookup used only the system-configured DNS
+   resolver. On some networks (observed on a real machine: a router/ISP
+   that silently fails dnspython's raw queries even though normal apps
+   resolve fine, and identically in this dev sandbox) EVERY lookup times
+   out, so nothing can ever verify as acceptable/risky. Fixed to retry via
+   public resolvers (8.8.8.8/1.1.1.1) when the system resolver errors.
+7. email_harvester.write.run_write crashed with an unhandled PermissionError
+   if the output .xlsx was open elsewhere (e.g. in Excel — a very common
+   real workflow: review the last run's output, forget to close it, run
+   again), throwing away an entire pipeline run's work. Fixed to fall back
+   to a timestamped filename instead of crashing.
 
-No real network calls are made: httpx fetching is monkeypatched out.
+No real network calls are made: httpx fetching and DNS resolution are
+monkeypatched out.
 """
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from email_harvester import discover
+import dns.exception
+
+from email_harvester import discover, verify, write
+from email_harvester.db import init_db, get_conn, upsert_business, upsert_email
 from email_harvester.extract import extract_emails
 
 
@@ -194,6 +223,213 @@ class ObfuscatedEmailTests(unittest.TestCase):
     def test_skip_domains_excluded(self):
         emails = self._extract("test at example.com is a placeholder")
         self.assertNotIn("test@example.com", emails)
+
+    def test_skip_domains_matches_subdomains(self):
+        """Regression test for the fix: a Sentry DSN key formatted like an
+        email (embedded by Wix sites in <script> tags) must be caught by the
+        "wixpress.com" skip entry even though the actual domain is a
+        subdomain (sentry.wixpress.com / sentry-next.wixpress.com)."""
+        html = (
+            "<html><body><script>"
+            'sentryConfig.dsn = "https://605a7baede844d278b89dc95ae0a9123'
+            '@sentry-next.wixpress.com/12345";'
+            'otherConfig.dsn = "https://dd0a55ccb8124b9c9d938e3acf41f8aa'
+            '@sentry.wixpress.com/67890";'
+            "</script></body></html>"
+        )
+        emails = [r["email"] for r in extract_emails(html, "https://example.test")]
+        self.assertEqual(emails, [])
+
+    def test_domain_com_placeholder_skipped(self):
+        emails = self._extract("contact user at domain.com for a quote")
+        self.assertNotIn("user@domain.com", emails)
+
+    def test_skip_does_not_over_match_similar_domains(self):
+        """Guard against a naive substring fix: "notgoogle.com" must NOT be
+        treated as a subdomain of the skipped "google.com"."""
+        emails = self._extract("Reach us at jane@notgoogle.com directly.")
+        self.assertIn("jane@notgoogle.com", emails)
+
+
+# ---------------------------------------------------------------------------
+# MX-error handling in verify.py
+# ---------------------------------------------------------------------------
+
+class VerifyMxErrorTests(unittest.TestCase):
+    """DNS resolution is monkeypatched — no real network/DNS calls are made,
+    which also matches this environment's actual DNS being unreachable."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self._tmpdir.name) / "test.db")
+        init_db(self.db_path)
+        with get_conn(self.db_path) as conn:
+            biz_id = upsert_business(
+                conn, niche="plumber", location="Austin, TX",
+                business_name="Joe's Plumbing", website_url="https://joesplumbing.com",
+                phone=None, address=None, category=None, source="yellowpages",
+            )
+            upsert_email(conn, business_id=biz_id, email="joe@joesplumbing.com",
+                         source_url=None, extract_method="mailto")
+            self.email_id = conn.execute(
+                "SELECT id FROM emails WHERE email=?", ("joe@joesplumbing.com",)
+            ).fetchone()["id"]
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _row(self):
+        with get_conn(self.db_path) as conn:
+            return dict(conn.execute(
+                "SELECT * FROM emails WHERE id=?", (self.email_id,)
+            ).fetchone())
+
+    def test_mx_error_leaves_row_unverified_for_retry(self):
+        """Regression test for the fix: a DNS timeout/error must NOT be
+        recorded as a passing tier, and must NOT stamp verified_at, so the
+        row is picked up again (WHERE verified_at IS NULL) on the next run."""
+        with patch.object(verify, "_mx_lookup", return_value="error"):
+            verify.run_verify(self.db_path)
+
+        row = self._row()
+        self.assertEqual(row["mx_status"], "error")
+        self.assertIsNone(row["tier"])
+        self.assertIsNone(row["verified_at"])
+
+    def test_mx_error_then_success_on_retry(self):
+        """After a transient DNS error, a later run_verify call (once DNS is
+        reachable again) must still be able to verify the same row."""
+        with patch.object(verify, "_mx_lookup", return_value="error"):
+            verify.run_verify(self.db_path)
+        self.assertIsNone(self._row()["verified_at"])
+
+        with patch.object(verify, "_mx_lookup", return_value="acceptable"):
+            verify.run_verify(self.db_path)
+
+        row = self._row()
+        self.assertEqual(row["tier"], "acceptable")
+        self.assertIsNotNone(row["verified_at"])
+
+    def test_mx_acceptable_sets_tier_and_verified_at(self):
+        with patch.object(verify, "_mx_lookup", return_value="acceptable"):
+            verify.run_verify(self.db_path)
+
+        row = self._row()
+        self.assertEqual(row["tier"], "acceptable")
+        self.assertIsNotNone(row["verified_at"])
+
+    def test_mx_invalid_sets_tier_invalid(self):
+        with patch.object(verify, "_mx_lookup", return_value="invalid"):
+            verify.run_verify(self.db_path)
+
+        row = self._row()
+        self.assertEqual(row["tier"], "invalid")
+        self.assertIsNotNone(row["verified_at"])
+
+
+# ---------------------------------------------------------------------------
+# Public-DNS fallback in _mx_lookup
+# ---------------------------------------------------------------------------
+
+class MxFallbackResolverTests(unittest.TestCase):
+    def setUp(self):
+        verify._mx_cache.clear()
+
+    def tearDown(self):
+        verify._mx_cache.clear()
+
+    def test_falls_back_to_public_dns_when_system_resolver_times_out(self):
+        """Regression test for the fix: on a network where the system
+        resolver silently fails dnspython's queries (observed for real —
+        even gmail.com timed out), _mx_lookup must retry via the public-DNS
+        fallback instead of giving up immediately."""
+        with patch.object(verify._RESOLVER, "resolve", side_effect=dns.exception.Timeout()), \
+             patch.object(verify._FALLBACK_RESOLVER, "resolve", return_value=[MagicMock()]):
+            status = verify._mx_lookup("example-fallback-test.com")
+
+        self.assertEqual(status, "acceptable")
+
+    def test_reports_error_only_when_both_resolvers_fail(self):
+        with patch.object(verify._RESOLVER, "resolve", side_effect=dns.exception.Timeout()), \
+             patch.object(verify._FALLBACK_RESOLVER, "resolve", side_effect=dns.exception.Timeout()):
+            status = verify._mx_lookup("example-both-fail-test.com")
+
+        self.assertEqual(status, "error")
+
+    def test_does_not_use_fallback_when_system_resolver_succeeds(self):
+        """The fallback resolver should only be tried when the system one
+        fails — not on every lookup."""
+        fallback_resolve = MagicMock()
+        with patch.object(verify._RESOLVER, "resolve", return_value=[MagicMock()]), \
+             patch.object(verify._FALLBACK_RESOLVER, "resolve", fallback_resolve):
+            status = verify._mx_lookup("example-system-ok-test.com")
+
+        self.assertEqual(status, "acceptable")
+        fallback_resolve.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Locked-output-file fallback in write.py
+# ---------------------------------------------------------------------------
+
+class WritePermissionErrorTests(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self._tmpdir.name) / "test.db")
+        init_db(self.db_path)
+        with get_conn(self.db_path) as conn:
+            biz_id = upsert_business(
+                conn, niche="plumber", location="Austin, TX",
+                business_name="Joe's Plumbing", website_url="https://joesplumbing.com",
+                phone="555-1234", address="1 Main St", category="Plumbing",
+                source="yellowpages",
+            )
+            upsert_email(conn, business_id=biz_id, email="joe@joesplumbing.com",
+                         source_url=None, extract_method="mailto")
+            conn.execute(
+                "UPDATE emails SET tier='acceptable', mx_status='acceptable' WHERE email=?",
+                ("joe@joesplumbing.com",),
+            )
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_falls_back_to_timestamped_path_when_output_is_locked(self):
+        """Regression test for the fix: a locked output file (e.g. open in
+        Excel — the file that's open when the previous run's results are
+        being reviewed) must not crash the whole pipeline and discard a
+        completed run's data; it must save under an alternate name."""
+        out_path = str(Path(self._tmpdir.name) / "leads.xlsx")
+        real_save = None
+        call_count = {"n": 0}
+
+        def fake_save(self_wb, path):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise PermissionError(13, "Permission denied", path)
+            return real_save(self_wb, path)
+
+        import openpyxl
+        real_save = openpyxl.Workbook.save
+        with patch("openpyxl.Workbook.save", fake_save):
+            result_path = write.run_write(
+                db_path=self.db_path, niche="plumber", location="Austin, TX",
+                out_path=out_path, suppress_path=None,
+            )
+
+        self.assertNotEqual(result_path, out_path)
+        self.assertTrue(Path(result_path).exists())
+        self.assertFalse(Path(out_path).exists())
+        self.assertEqual(call_count["n"], 2)
+
+    def test_saves_normally_when_not_locked(self):
+        out_path = str(Path(self._tmpdir.name) / "leads.xlsx")
+        result_path = write.run_write(
+            db_path=self.db_path, niche="plumber", location="Austin, TX",
+            out_path=out_path, suppress_path=None,
+        )
+        self.assertEqual(result_path, out_path)
+        self.assertTrue(Path(result_path).exists())
 
 
 if __name__ == "__main__":

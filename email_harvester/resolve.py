@@ -13,7 +13,6 @@ Already-resolved rows (resolve_status != 'pending') are skipped — idempotent.
 
 import logging
 import re
-import sqlite3
 import urllib.parse
 from typing import Optional
 

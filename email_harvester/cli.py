@@ -9,9 +9,7 @@ the last completed point in SQLite.
 """
 
 import logging
-import os
 import sys
-from pathlib import Path
 from typing import Optional
 
 import click

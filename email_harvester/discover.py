@@ -17,13 +17,6 @@ from typing import Iterator
 
 import httpx
 from bs4 import BeautifulSoup
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-    before_sleep_log,
-)
 
 from .db import get_conn, upsert_business, count_businesses
 from .proxy import get_pool

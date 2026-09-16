@@ -2,7 +2,6 @@
 
 import logging
 import re
-from typing import Iterable
 
 from bs4 import BeautifulSoup
 
@@ -28,6 +27,8 @@ _ENTITY_AT_RE = re.compile(r"&#(?:64|x40);", re.IGNORECASE)
 _SKIP_DOMAINS = frozenset(
     [
         "example.com",
+        "domain.com",
+        "yourdomain.com",
         "sentry.io",
         "w3.org",
         "schema.org",
@@ -57,7 +58,12 @@ def _skip(email: str) -> bool:
         domain = email.split("@", 1)[1].lower()
     except IndexError:
         return True
-    return domain in _SKIP_DOMAINS or email.startswith("//")
+    if email.startswith("//"):
+        return True
+    # Match the domain itself or any subdomain of it (e.g. "sentry.wixpress.com"
+    # and "sentry-next.wixpress.com" — Sentry DSN keys embedded by Wix sites,
+    # which look exactly like emails — must be caught by the "wixpress.com" entry).
+    return any(domain == d or domain.endswith("." + d) for d in _SKIP_DOMAINS)
 
 
 # ---------------------------------------------------------------------------
