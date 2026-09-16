@@ -21,9 +21,10 @@ from typing import Optional
 import httpx
 from bs4 import BeautifulSoup
 
-from .db import get_conn, upsert_email
+from .db import get_conn, upsert_email, upsert_social
 from .extract import extract_emails
 from .proxy import get_pool
+from .social import _extract_social_from_html
 
 logger = logging.getLogger(__name__)
 
@@ -134,26 +135,35 @@ def _discover_contact_links(html: str, base_url: str) -> list[str]:
     return links[:MAX_PAGES_PER_SITE]
 
 
-def _crawl_site_static(base_url: str) -> tuple[list[dict], list[str]]:
+def _crawl_site_static(base_url: str) -> tuple[list[dict], list[str], dict]:
     """
     Fetch homepage + standard paths + discovered contact links.
-    Returns (emails_list, pages_visited).
+    Returns (emails_list, pages_visited, social_links).
+    social_links is {"facebook": url|None, "instagram": url|None, "linkedin": url|None},
+    merged across every page visited (first match per platform wins).
     """
     pool = get_pool()
     proxy = pool.get()
 
     all_emails: dict[str, dict] = {}  # email -> first-seen dict
     pages_visited: list[str] = []
+    social: dict[str, str | None] = {"facebook": None, "instagram": None, "linkedin": None}
+
+    def _merge_social(page_html: str) -> None:
+        for key, value in _extract_social_from_html(page_html).items():
+            if social[key] is None and value:
+                social[key] = value
 
     with _make_client(proxy) as client:
         # Homepage first
         html = _fetch_page(client, base_url)
         if html is None:
-            return [], []
+            return [], [], social
 
         pages_visited.append(base_url)
         for item in extract_emails(html, base_url):
             all_emails.setdefault(item["email"], item | {"source_url": base_url})
+        _merge_social(html)
 
         # Discover contact/about links from homepage
         discovered = _discover_contact_links(html, base_url)
@@ -183,8 +193,9 @@ def _crawl_site_static(base_url: str) -> tuple[list[dict], list[str]]:
             pages_visited.append(page_url)
             for item in extract_emails(sub_html, page_url):
                 all_emails.setdefault(item["email"], item | {"source_url": page_url})
+            _merge_social(sub_html)
 
-    return list(all_emails.values()), pages_visited
+    return list(all_emails.values()), pages_visited, social
 
 
 def _crawl_site_playwright(base_url: str) -> list[dict]:
@@ -263,7 +274,7 @@ def run_crawl(db_path: str) -> None:
         logger.info("[CRAWL] (%d/%d) %s", i, total, site_url)
 
         try:
-            emails, pages = _crawl_site_static(site_url)
+            emails, pages, social = _crawl_site_static(site_url)
         except Exception as exc:
             logger.error("[CRAWL] Unhandled error for %s: %s", site_url, exc)
             with get_conn(db_path) as conn:
@@ -299,6 +310,18 @@ def run_crawl(db_path: str) -> None:
                 "UPDATE businesses SET crawl_status=? WHERE id=?",
                 (crawl_status, biz_id),
             )
+
+        # Opportunistically save any social links found while we already had
+        # the pages fetched — SOCIAL stage will skip businesses this covers.
+        if any(social.values()):
+            with get_conn(db_path) as conn:
+                upsert_social(
+                    conn,
+                    business_id=biz_id,
+                    facebook_url=social.get("facebook"),
+                    instagram_url=social.get("instagram"),
+                    linkedin_url=social.get("linkedin"),
+                )
 
         emails_found += len(emails)
         crawled += 1

@@ -5,7 +5,8 @@ Reads verified emails from SQLite, applies suppression list,
 deduplicates (by email then by domain), and writes an Excel file.
 
 Output columns (exact order):
-  Company Name | Owner Name | Phone | Category | Email | Website | Address | Comment
+  Company Name | Owner Name | Phone | Category | Email | Website |
+  Facebook | Instagram | LinkedIn | Address | Comment
 
 Comment format:
   mx_status=acceptable; role=false; source=yellowpages
@@ -34,6 +35,9 @@ COLUMNS = [
     "Category",
     "Email",
     "Website",
+    "Facebook",
+    "Instagram",
+    "LinkedIn",
     "Address",
     "Comment",
 ]
@@ -197,6 +201,9 @@ def run_write(
                 b.address,
                 b.normalized_url AS website,
                 b.website_url    AS website_raw,
+                b.facebook_url,
+                b.instagram_url,
+                b.linkedin_url,
                 b.source,
                 e.email,
                 e.extract_method,
@@ -259,6 +266,9 @@ def run_write(
                 row["category"] or "",
                 row["email"],
                 website,
+                row["facebook_url"] or "",
+                row["instagram_url"] or "",
+                row["linkedin_url"] or "",
                 row["address"] or "",
                 comment,
             ]

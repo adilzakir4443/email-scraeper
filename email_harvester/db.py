@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS businesses (
     resolve_status   TEXT    DEFAULT 'pending',  -- pending | done | no_site | failed
     crawl_status     TEXT    DEFAULT 'pending',  -- pending | done | failed | no_emails_static
     playwright_tried INTEGER DEFAULT 0,
+    facebook_url     TEXT,
+    instagram_url    TEXT,
+    linkedin_url     TEXT,
+    social_status    TEXT    DEFAULT 'pending',  -- pending | done
     UNIQUE(niche, location, business_name, source)
 );
 
@@ -53,6 +57,26 @@ CREATE INDEX IF NOT EXISTS idx_emails_tier        ON emails(tier);
 """
 
 
+# Columns added to `businesses` after it was first created. CREATE TABLE IF
+# NOT EXISTS does not retrofit new columns onto an existing table, so a DB
+# from before a given column was added needs an explicit ALTER TABLE — this
+# keeps init_db safe to run against old databases without breaking them.
+_BUSINESS_COLUMN_MIGRATIONS: dict[str, str] = {
+    "facebook_url":  "ALTER TABLE businesses ADD COLUMN facebook_url TEXT",
+    "instagram_url": "ALTER TABLE businesses ADD COLUMN instagram_url TEXT",
+    "linkedin_url":  "ALTER TABLE businesses ADD COLUMN linkedin_url TEXT",
+    "social_status": "ALTER TABLE businesses ADD COLUMN social_status TEXT DEFAULT 'pending'",
+}
+
+
+def _migrate_business_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(businesses)")}
+    for column, ddl in _BUSINESS_COLUMN_MIGRATIONS.items():
+        if column not in existing:
+            conn.execute(ddl)
+            logger.info("Migrated businesses table: added column %s", column)
+
+
 def init_db(db_path: str) -> None:
     """Create tables if they don't exist. Safe to call on every run."""
     path = Path(db_path)
@@ -60,6 +84,7 @@ def init_db(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate_business_columns(conn)
         conn.commit()
     finally:
         # sqlite3.Connection's context-manager protocol only commits/rolls
@@ -133,6 +158,33 @@ def upsert_email(
         VALUES (?, ?, ?, ?)
         """,
         (business_id, email, source_url, extract_method),
+    )
+
+
+def upsert_social(
+    conn: sqlite3.Connection,
+    *,
+    business_id: int,
+    facebook_url: str | None,
+    instagram_url: str | None,
+    linkedin_url: str | None,
+) -> None:
+    """
+    Set social links on a business, only filling in fields that are still
+    NULL (never overwrites an already-found link), then marks social_status
+    as 'done' regardless of whether anything new was found — a business
+    that was searched and came up empty should not be retried forever.
+    """
+    conn.execute(
+        """
+        UPDATE businesses
+        SET facebook_url  = COALESCE(facebook_url, ?),
+            instagram_url = COALESCE(instagram_url, ?),
+            linkedin_url  = COALESCE(linkedin_url, ?),
+            social_status = 'done'
+        WHERE id = ?
+        """,
+        (facebook_url, instagram_url, linkedin_url, business_id),
     )
 
 

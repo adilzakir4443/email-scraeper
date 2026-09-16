@@ -45,7 +45,7 @@ def _configure_logging(verbose: bool) -> None:
 @click.option("--proxy-pool", "proxy_pool", default=None,
               help="Comma-separated proxy URLs (overrides PROXY_POOL env var)")
 @click.option("--stage",    "stage",        default="all",
-              type=click.Choice(["all", "discover", "resolve", "crawl", "verify", "write"],
+              type=click.Choice(["all", "discover", "resolve", "crawl", "social", "verify", "write"],
                                 case_sensitive=False),
               show_default=True,
               help="Run a single stage instead of the full pipeline")
@@ -65,7 +65,7 @@ def main(
     """
     email-harvester — scrape US business directories and extract contact emails.
 
-    Runs four resumable stages: DISCOVER → RESOLVE → CRAWL → VERIFY+WRITE.
+    Runs resumable stages: DISCOVER → RESOLVE → CRAWL → SOCIAL → VERIFY+WRITE.
     All state is persisted in SQLite so the tool can be safely interrupted and
     restarted without losing progress.
 
@@ -107,6 +107,10 @@ def main(
     if stage in ("all", "crawl"):
         from .crawl import run_crawl
         run_crawl(db_path)
+
+    if stage in ("all", "social"):
+        from .social import run_social
+        run_social(db_path)
 
     if stage in ("all", "verify"):
         from .verify import run_verify
