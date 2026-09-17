@@ -37,11 +37,29 @@ Tests for the Bing scraper and obfuscated-email regex fixes:
    real workflow: review the last run's output, forget to close it, run
    again), throwing away an entire pipeline run's work. Fixed to fall back
    to a timestamped filename instead of crashing.
+8. email_harvester.extract's raw-regex pass scans full HTML including
+   attribute values, so when a page concatenates address/phone/email with
+   no separator (observed for real: a WordPress SEO plugin's auto-generated
+   <meta name="description"> rendered "...Austin TX 78702512.355.1557
+   info@ruralrooster.com"), the ZIP+phone digits get greedily absorbed into
+   the email's local part by _EMAIL_RE. Added _strip_glued_phone_prefix to
+   strip a recognizable ZIP/phone prefix off the start of a local part.
+   Also added "email.com" to _SKIP_DOMAINS (observed for real: a newsletter
+   form's placeholder="your@email.com" being extracted as a real address).
+9. email_harvester.social — new SOCIAL stage that finds Facebook/Instagram/
+   LinkedIn links (from a business's own site, or via Bing search fallback).
+   Bing wraps every organic-result href in a bing.com/ck/a redirect whose
+   real destination is base64-encoded in its "u" parameter (verified live:
+   even fully relevant results are never a bare facebook.com/instagram.com
+   href), so pattern-matching hrefs directly would never find anything even
+   when Bing returns a correct result — _unwrap_bing_redirect decodes it
+   first.
 
 No real network calls are made: httpx fetching and DNS resolution are
 monkeypatched out.
 """
 
+import base64
 import json
 import tempfile
 import unittest
@@ -50,8 +68,8 @@ from unittest.mock import patch, MagicMock
 
 import dns.exception
 
-from email_harvester import discover, verify, write
-from email_harvester.db import init_db, get_conn, upsert_business, upsert_email
+from email_harvester import crawl, discover, social, verify, write
+from email_harvester.db import init_db, get_conn, upsert_business, upsert_email, upsert_social
 from email_harvester.extract import extract_emails
 
 
@@ -244,6 +262,44 @@ class ObfuscatedEmailTests(unittest.TestCase):
         emails = self._extract("contact user at domain.com for a quote")
         self.assertNotIn("user@domain.com", emails)
 
+    def test_email_com_placeholder_skipped(self):
+        """Regression test: a form input's placeholder="your@email.com"
+        (a real newsletter signup form) was being extracted as if it were
+        the business's actual contact email."""
+        html = (
+            '<html><body><input placeholder="your@email.com" '
+            'name="emailaddr"></body></html>'
+        )
+        emails = [r["email"] for r in extract_emails(html, "https://example.test")]
+        self.assertNotIn("your@email.com", emails)
+
+    def test_strips_glued_zip_and_phone_from_regex_match(self):
+        """Regression test: a WordPress SEO plugin's auto-generated
+        <meta name="description"> concatenated the page's address, ZIP,
+        phone, and email with no separators at all, e.g.
+        "...Austin TX 78702512.355.1557info@ruralrooster.com" — the ZIP and
+        phone digits must not end up glued onto the email's local part."""
+        html = (
+            '<html><head><meta name="description" content='
+            '"Contact UsRural Rooster Print &amp; Design3504 E. 4th St'
+            'Unit CAustin TX 78702512.355.1557info@ruralrooster.com" />'
+            "</head><body></body></html>"
+        )
+        emails = [r["email"] for r in extract_emails(html, "https://ruralrooster.com/contact")]
+        self.assertIn("info@ruralrooster.com", emails)
+        self.assertNotIn("78702512.355.1557info@ruralrooster.com", emails)
+
+    def test_strips_glued_phone_without_zip(self):
+        emails = self._extract("Call 512.355.1557info@ruralrooster.com now")
+        self.assertIn("info@ruralrooster.com", emails)
+
+    def test_does_not_mangle_local_part_with_digits(self):
+        """Guard against over-stripping: a legitimate local part that merely
+        contains digits (too short to look like a real phone number) must
+        pass through unchanged."""
+        emails = self._extract("Email: sales2024@realbusiness.com")
+        self.assertIn("sales2024@realbusiness.com", emails)
+
     def test_skip_does_not_over_match_similar_domains(self):
         """Guard against a naive substring fix: "notgoogle.com" must NOT be
         treated as a subdomain of the skipped "google.com"."""
@@ -430,6 +486,384 @@ class WritePermissionErrorTests(unittest.TestCase):
         )
         self.assertEqual(result_path, out_path)
         self.assertTrue(Path(result_path).exists())
+
+
+# ---------------------------------------------------------------------------
+# social.py: HTML scanning, Bing redirect decoding, DB upsert
+# ---------------------------------------------------------------------------
+
+class SocialExtractFromHtmlTests(unittest.TestCase):
+    def test_finds_real_links_and_ignores_fb_noise(self):
+        html = (
+            '<html><body>'
+            '<a href="https://www.facebook.com/sharer/sharer.php?u=x">Share</a>'
+            '<a href="https://www.facebook.com/plugins/like.php?href=x">Like</a>'
+            '<a href="https://www.facebook.com/tr?id=123">pixel</a>'
+            '<a href="https://www.facebook.com/RuralRoosterAustin">Follow us</a>'
+            '<a href="https://www.instagram.com/ruralrooster/">Instagram</a>'
+            '<a href="https://www.linkedin.com/company/rural-rooster">LinkedIn</a>'
+            '</body></html>'
+        )
+        result = social._extract_social_from_html(html)
+        self.assertEqual(result, {
+            "facebook": "https://www.facebook.com/RuralRoosterAustin",
+            "instagram": "https://www.instagram.com/ruralrooster/",
+            "linkedin": "https://www.linkedin.com/company/rural-rooster",
+        })
+
+    def test_missing_platforms_are_none(self):
+        html = '<html><body><p>No social links here</p></body></html>'
+        result = social._extract_social_from_html(html)
+        self.assertEqual(result, {"facebook": None, "instagram": None, "linkedin": None})
+
+
+class FbIgnorePathTests(unittest.TestCase):
+    def test_ignored_paths_are_filtered_by_segment(self):
+        for path in ["sharer", "share", "dialog", "plugins", "tr", "hashtag"]:
+            url = f"https://www.facebook.com/{path}?x=1"
+            self.assertTrue(social._is_ignored_fb_path(url), f"{path} should be ignored")
+
+    def test_does_not_over_match_as_substring(self):
+        """Regression guard: a real page named e.g. "SharersDelightBakery"
+        must NOT be filtered just because "sharer" is a substring of it."""
+        self.assertFalse(social._is_ignored_fb_path("https://www.facebook.com/SharersDelightBakery"))
+        self.assertFalse(social._is_ignored_fb_path("https://www.facebook.com/hashtagheroes"))
+
+    def test_nested_ignored_path_still_caught(self):
+        self.assertTrue(social._is_ignored_fb_path("https://www.facebook.com/sharer.php?u=x"))
+
+
+class BingRedirectDecodeTests(unittest.TestCase):
+    def test_decodes_real_destination_from_redirect(self):
+        """Regression test: Bing wraps every organic-result href in a
+        bing.com/ck/a redirect — verified live that even a fully relevant
+        result is never a bare destination href. Without decoding this,
+        _bing_search_social could never find anything."""
+        real_url = "https://www.facebook.com/RuralRoosterAustin"
+        encoded = "a1" + base64.urlsafe_b64encode(real_url.encode()).decode().rstrip("=")
+        wrapped = f"https://www.bing.com/ck/a?!&&p=abc123&u={encoded}&ntb=1"
+        self.assertEqual(social._unwrap_bing_redirect(wrapped), real_url)
+
+    def test_non_redirect_url_passed_through_unchanged(self):
+        url = "https://example.com/foo"
+        self.assertEqual(social._unwrap_bing_redirect(url), url)
+
+    def test_malformed_redirect_falls_back_to_original(self):
+        bad = "https://www.bing.com/ck/a?u=not-valid-base64!!!"
+        # Must not raise — either decodes to something or returns the input.
+        result = social._unwrap_bing_redirect(bad)
+        self.assertIsInstance(result, str)
+
+
+class CiteReconstructionTests(unittest.TestCase):
+    def test_reconstructs_url_from_breadcrumb_with_scheme(self):
+        cite = "https://www.facebook.com › RuralRoosterAustin"
+        result = social._reconstruct_from_cite(cite, "facebook.com")
+        self.assertEqual(result, "https://www.facebook.com/RuralRoosterAustin")
+
+    def test_reconstructs_url_from_breadcrumb_without_scheme(self):
+        cite = "facebook.com › pagename"
+        result = social._reconstruct_from_cite(cite, "facebook.com")
+        self.assertEqual(result, "https://facebook.com/pagename")
+
+    def test_returns_none_for_unrelated_domain(self):
+        cite = "https://dictionary.cambridge.org › dictionary › english › rural"
+        self.assertIsNone(social._reconstruct_from_cite(cite, "facebook.com"))
+
+
+class BingSearchSocialTests(unittest.TestCase):
+    """_bing_search_social exercised against synthetic Bing-shaped HTML —
+    no real network calls."""
+
+    def _fake_result_page(self, real_url: str) -> str:
+        encoded = "a1" + base64.urlsafe_b64encode(real_url.encode()).decode().rstrip("=")
+        wrapped = f"https://www.bing.com/ck/a?!&&p=abc123&u={encoded}&ntb=1"
+        return f'''
+        <html><body><ol id="b_results">
+          <li class="b_algo">
+            <h2><a href="{wrapped}">Rural Rooster on Facebook</a></h2>
+            <div class="b_caption"><cite>{real_url}</cite></div>
+          </li>
+        </ol></body></html>
+        '''
+
+    def test_finds_and_decodes_real_result(self):
+        real_url = "https://www.facebook.com/RuralRoosterAustin"
+        html = self._fake_result_page(real_url)
+        with patch.object(social, "_fetch", return_value=html), \
+             patch.object(social, "_make_client") as make_client_mock:
+            make_client_mock.return_value.__enter__.return_value = MagicMock()
+            make_client_mock.return_value.__exit__.return_value = False
+            result = social._bing_search_social("Rural Rooster", "Austin, TX", "facebook")
+
+        self.assertEqual(result, real_url)
+
+    def test_returns_none_when_no_results(self):
+        with patch.object(social, "_fetch", return_value="<html><body>no results</body></html>"), \
+             patch.object(social, "_make_client") as make_client_mock:
+            make_client_mock.return_value.__enter__.return_value = MagicMock()
+            make_client_mock.return_value.__exit__.return_value = False
+            result = social._bing_search_social("Rural Rooster", "Austin, TX", "facebook")
+
+        self.assertIsNone(result)
+
+    def test_returns_none_when_fetch_fails(self):
+        with patch.object(social, "_fetch", return_value=None), \
+             patch.object(social, "_make_client") as make_client_mock:
+            make_client_mock.return_value.__enter__.return_value = MagicMock()
+            make_client_mock.return_value.__exit__.return_value = False
+            result = social._bing_search_social("Rural Rooster", "Austin, TX", "facebook")
+
+        self.assertIsNone(result)
+
+
+class UpsertSocialTests(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self._tmpdir.name) / "test.db")
+        init_db(self.db_path)
+        with get_conn(self.db_path) as conn:
+            self.biz_id = upsert_business(
+                conn, niche="plumber", location="Austin, TX",
+                business_name="Joe's Plumbing", website_url="https://joesplumbing.com",
+                phone=None, address=None, category=None, source="yellowpages",
+            )
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _row(self):
+        with get_conn(self.db_path) as conn:
+            return dict(conn.execute(
+                "SELECT * FROM businesses WHERE id=?", (self.biz_id,)
+            ).fetchone())
+
+    def test_sets_fields_and_marks_done(self):
+        with get_conn(self.db_path) as conn:
+            upsert_social(
+                conn, business_id=self.biz_id,
+                facebook_url="https://facebook.com/joesplumbing",
+                instagram_url=None, linkedin_url=None,
+            )
+        row = self._row()
+        self.assertEqual(row["facebook_url"], "https://facebook.com/joesplumbing")
+        self.assertIsNone(row["instagram_url"])
+        self.assertEqual(row["social_status"], "done")
+
+    def test_does_not_overwrite_existing_value(self):
+        """Regression test: upsert_social must only fill NULL fields, never
+        overwrite a link already found (e.g. by CRAWL) with a later None."""
+        with get_conn(self.db_path) as conn:
+            upsert_social(
+                conn, business_id=self.biz_id,
+                facebook_url="https://facebook.com/joesplumbing",
+                instagram_url=None, linkedin_url=None,
+            )
+        with get_conn(self.db_path) as conn:
+            upsert_social(
+                conn, business_id=self.biz_id,
+                facebook_url=None,
+                instagram_url="https://instagram.com/joesplumbing",
+                linkedin_url=None,
+            )
+        row = self._row()
+        self.assertEqual(row["facebook_url"], "https://facebook.com/joesplumbing")
+        self.assertEqual(row["instagram_url"], "https://instagram.com/joesplumbing")
+
+    def test_marks_done_even_when_nothing_found(self):
+        """A business that was searched and came up empty must not be
+        retried forever."""
+        with get_conn(self.db_path) as conn:
+            upsert_social(
+                conn, business_id=self.biz_id,
+                facebook_url=None, instagram_url=None, linkedin_url=None,
+            )
+        row = self._row()
+        self.assertEqual(row["social_status"], "done")
+
+
+class RunSocialSkipTests(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self._tmpdir.name) / "test.db")
+        init_db(self.db_path)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_skips_businesses_already_marked_done(self):
+        with get_conn(self.db_path) as conn:
+            biz_id = upsert_business(
+                conn, niche="plumber", location="Austin, TX",
+                business_name="Already Done Co", website_url="https://example-abc.com",
+                phone=None, address=None, category=None, source="yellowpages",
+            )
+            upsert_social(conn, business_id=biz_id, facebook_url=None,
+                          instagram_url=None, linkedin_url=None)
+
+        with patch.object(social, "_extract_from_website") as extract_mock, \
+             patch.object(social, "_find_social_no_website") as search_mock:
+            social.run_social(self.db_path)
+
+        extract_mock.assert_not_called()
+        search_mock.assert_not_called()
+
+    def test_processes_pending_business_with_website(self):
+        with get_conn(self.db_path) as conn:
+            biz_id = upsert_business(
+                conn, niche="plumber", location="Austin, TX",
+                business_name="Pending Co", website_url="https://example-xyz.com",
+                phone=None, address=None, category=None, source="yellowpages",
+            )
+
+        with patch.object(social, "_extract_from_website",
+                           return_value={"facebook": "https://facebook.com/pendingco",
+                                         "instagram": None, "linkedin": None}) as extract_mock, \
+             patch.object(social, "_find_social_no_website") as search_mock, \
+             patch.object(social, "time"):
+            social.run_social(self.db_path)
+
+        extract_mock.assert_called_once()
+        search_mock.assert_not_called()
+
+        with get_conn(self.db_path) as conn:
+            row = dict(conn.execute(
+                "SELECT * FROM businesses WHERE id=?", (biz_id,)
+            ).fetchone())
+        self.assertEqual(row["facebook_url"], "https://facebook.com/pendingco")
+        self.assertEqual(row["social_status"], "done")
+
+    def test_falls_back_to_search_when_website_yields_nothing(self):
+        with get_conn(self.db_path) as conn:
+            biz_id = upsert_business(
+                conn, niche="plumber", location="Austin, TX",
+                business_name="No Social Co", website_url="https://example-qrs.com",
+                phone=None, address=None, category=None, source="yellowpages",
+            )
+
+        with patch.object(social, "_extract_from_website",
+                           return_value={"facebook": None, "instagram": None, "linkedin": None}), \
+             patch.object(social, "_find_social_no_website",
+                           return_value={"facebook": "https://facebook.com/foundviabing",
+                                         "instagram": None, "linkedin": None}) as search_mock, \
+             patch.object(social, "time"):
+            social.run_social(self.db_path)
+
+        search_mock.assert_called_once()
+
+        with get_conn(self.db_path) as conn:
+            row = dict(conn.execute(
+                "SELECT facebook_url FROM businesses WHERE id=?", (biz_id,)
+            ).fetchone())
+        self.assertEqual(row["facebook_url"], "https://facebook.com/foundviabing")
+
+
+# ---------------------------------------------------------------------------
+# crawl.py: _crawl_site_static's 3-tuple return, conditional upsert_social
+# ---------------------------------------------------------------------------
+
+class CrawlStaticSocialTests(unittest.TestCase):
+    def test_merges_social_links_across_pages(self):
+        homepage_html = (
+            '<html><body><a href="https://www.facebook.com/joesplumbing">FB</a></body></html>'
+        )
+        contact_html = (
+            '<html><body><a href="https://www.instagram.com/joesplumbing/">IG</a></body></html>'
+        )
+
+        def fake_fetch(client, url):
+            if url == "https://joesplumbing.com":
+                return homepage_html
+            if url == "https://joesplumbing.com/contact":
+                return contact_html
+            return None
+
+        with patch.object(crawl, "_fetch_page", side_effect=fake_fetch), \
+             patch.object(crawl, "_discover_contact_links", return_value=[]), \
+             patch.object(crawl, "_make_client") as make_client_mock, \
+             patch.object(crawl, "time"):
+            make_client_mock.return_value.__enter__.return_value = MagicMock()
+            make_client_mock.return_value.__exit__.return_value = False
+            emails, pages, social_links = crawl._crawl_site_static("https://joesplumbing.com")
+
+        self.assertEqual(social_links["facebook"], "https://www.facebook.com/joesplumbing")
+        self.assertEqual(social_links["instagram"], "https://www.instagram.com/joesplumbing/")
+        self.assertIsNone(social_links["linkedin"])
+
+    def test_returns_empty_social_when_homepage_unreachable(self):
+        with patch.object(crawl, "_fetch_page", return_value=None), \
+             patch.object(crawl, "_make_client") as make_client_mock:
+            make_client_mock.return_value.__enter__.return_value = MagicMock()
+            make_client_mock.return_value.__exit__.return_value = False
+            emails, pages, social_links = crawl._crawl_site_static("https://unreachable.example")
+
+        self.assertEqual(emails, [])
+        self.assertEqual(pages, [])
+        self.assertEqual(social_links, {"facebook": None, "instagram": None, "linkedin": None})
+
+
+class RunCrawlSocialTests(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self._tmpdir.name) / "test.db")
+        init_db(self.db_path)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _make_business(self, name: str, url: str) -> int:
+        with get_conn(self.db_path) as conn:
+            biz_id = upsert_business(
+                conn, niche="plumber", location="Austin, TX",
+                business_name=name, website_url=url,
+                phone=None, address=None, category=None, source="yellowpages",
+            )
+            conn.execute(
+                "UPDATE businesses SET resolve_status='done', normalized_url=? WHERE id=?",
+                (url, biz_id),
+            )
+        return biz_id
+
+    def test_upsert_social_called_when_social_links_found(self):
+        biz_id = self._make_business("Joe's Plumbing", "https://joesplumbing.com")
+        social_found = {"facebook": "https://facebook.com/joesplumbing",
+                         "instagram": None, "linkedin": None}
+        fake_email = {"email": "joe@joesplumbing.com", "method": "mailto",
+                      "source_url": "https://joesplumbing.com"}
+
+        with patch.object(crawl, "_crawl_site_static",
+                           return_value=([fake_email], ["https://joesplumbing.com"], social_found)), \
+             patch.object(crawl, "time"):
+            crawl.run_crawl(self.db_path)
+
+        with get_conn(self.db_path) as conn:
+            row = dict(conn.execute(
+                "SELECT facebook_url, social_status FROM businesses WHERE id=?", (biz_id,)
+            ).fetchone())
+        self.assertEqual(row["facebook_url"], "https://facebook.com/joesplumbing")
+        self.assertEqual(row["social_status"], "done")
+
+    def test_upsert_social_not_called_when_nothing_found(self):
+        """Regression test: when static crawl finds no social links, the
+        business must stay social_status='pending' (not prematurely marked
+        'done') so the dedicated SOCIAL stage can still try the Bing-search
+        fallback for it later."""
+        biz_id = self._make_business("No Social Co", "https://nosocial.com")
+        social_empty = {"facebook": None, "instagram": None, "linkedin": None}
+        fake_email = {"email": "info@nosocial.com", "method": "mailto",
+                      "source_url": "https://nosocial.com"}
+
+        with patch.object(crawl, "_crawl_site_static",
+                           return_value=([fake_email], ["https://nosocial.com"], social_empty)), \
+             patch.object(crawl, "time"):
+            crawl.run_crawl(self.db_path)
+
+        with get_conn(self.db_path) as conn:
+            row = dict(conn.execute(
+                "SELECT facebook_url, social_status FROM businesses WHERE id=?", (biz_id,)
+            ).fetchone())
+        self.assertIsNone(row["facebook_url"])
+        self.assertEqual(row["social_status"], "pending")
 
 
 if __name__ == "__main__":

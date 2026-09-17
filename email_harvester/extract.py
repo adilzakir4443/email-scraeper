@@ -29,6 +29,7 @@ _SKIP_DOMAINS = frozenset(
         "example.com",
         "domain.com",
         "yourdomain.com",
+        "email.com",
         "sentry.io",
         "w3.org",
         "schema.org",
@@ -50,6 +51,29 @@ _SKIP_DOMAINS = frozenset(
 
 def _normalise(email: str) -> str:
     return email.strip().lower()
+
+
+# A ZIP code (optional) immediately followed by a US-style phone number, with
+# or without separators. Pages sometimes concatenate "...address, ZIP, phone,
+# email..." with no whitespace between them — e.g. an auto-generated SEO meta
+# description rendered as "...Austin TX 78702512.355.1557info@site.com" — so
+# the ZIP/phone digits get greedily absorbed into the email's local part by
+# _EMAIL_RE. This anchors to the *start* of the local part only, so it can't
+# affect a real local part that merely contains digits elsewhere in it.
+_GLUED_PHONE_PREFIX_RE = re.compile(
+    r"^(?:\d{5}(?:-\d{4})?)?"        # optional ZIP or ZIP+4
+    r"(?:\(\d{3}\)\s*|\d{3}[.\-]?)"  # area code, with or without parens
+    r"\d{3}[.\-]?\d{4}"              # exchange + line number
+)
+
+
+def _strip_glued_phone_prefix(local: str) -> str:
+    """Strip a ZIP/phone-number prefix accidentally glued onto a local part.
+    Returns *local* unchanged if no such prefix is found, or if stripping it
+    would leave nothing behind (safer to keep the odd-looking original than
+    to produce an empty local part)."""
+    stripped = _GLUED_PHONE_PREFIX_RE.sub("", local, count=1)
+    return stripped if stripped else local
 
 
 def _skip(email: str) -> bool:
@@ -147,14 +171,22 @@ def extract_emails(html: str, page_url: str) -> list[dict[str, str]]:
         # Collapse any remaining whitespace
         cleaned = re.sub(r"\s+", "", cleaned)
         email = _normalise(cleaned)
+        if "@" in email:
+            local, _, domain_part = email.partition("@")
+            email = f"{_strip_glued_phone_prefix(local)}@{domain_part}"
         if _EMAIL_RE.fullmatch(email) and not _skip(email):
             results.setdefault(email, "obfuscated")
 
     # 4. Raw regex over full page text + all attribute values ----------------
     # Include attribute values to catch emails in data-* or title attributes
+    # (e.g. auto-generated SEO <meta name="description"> content, which is
+    # also where address/phone digits most often end up glued directly onto
+    # an email with no separator — see _strip_glued_phone_prefix).
     full_text = html
     for match in _EMAIL_RE.finditer(full_text):
         email = _normalise(match.group(0))
+        local, _, domain_part = email.partition("@")
+        email = f"{_strip_glued_phone_prefix(local)}@{domain_part}"
         if not _skip(email):
             results.setdefault(email, "regex")
 
