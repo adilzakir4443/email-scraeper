@@ -2,11 +2,19 @@
 Stage 4b — WRITE.
 
 Reads verified emails from SQLite, applies suppression list,
-deduplicates (by email then by domain), and writes an Excel file.
+deduplicates (by email then by domain), and writes an Excel file with two
+sheets:
+  "Leads"      — one row per verified email.
+  "No Website" — businesses with no site at all (nothing for CRAWL/VERIFY
+                 to work with), so their only follow-up contact is phone /
+                 social media, which SOCIAL's Bing-search fallback fills in.
 
-Output columns (exact order):
+Sheet 1 columns (exact order):
   Company Name | Owner Name | Phone | Category | Email | Website |
   Facebook | Instagram | LinkedIn | Address | Comment
+
+Sheet 2 columns (exact order):
+  Company Name | Phone | Category | Address | Facebook | Instagram | LinkedIn
 
 Comment format:
   mx_status=acceptable; role=false; source=yellowpages
@@ -40,6 +48,16 @@ COLUMNS = [
     "LinkedIn",
     "Address",
     "Comment",
+]
+
+NO_WEBSITE_COLUMNS = [
+    "Company Name",
+    "Phone",
+    "Category",
+    "Address",
+    "Facebook",
+    "Instagram",
+    "LinkedIn",
 ]
 
 # Tiers to include in output (invalid is dropped entirely)
@@ -169,6 +187,20 @@ def _style_header(ws) -> None:
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
 
 
+def _autofit_columns(ws, columns: list[str]) -> None:
+    """Approximate auto-fit: size each column to its longest cell value."""
+    for col_idx, col_name in enumerate(columns, 1):
+        col_letter = get_column_letter(col_idx)
+        max_len = len(col_name)
+        for cell in ws[col_letter]:
+            try:
+                if cell.value:
+                    max_len = max(max_len, len(str(cell.value)))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max_len + 4, 60)
+
+
 def run_write(
     db_path: str,
     niche: str,
@@ -279,19 +311,47 @@ def run_write(
             for cell in ws[ws.max_row]:
                 cell.fill = risky_fill
 
-    # Auto-fit column widths (approximate)
-    for col_idx, col_name in enumerate(COLUMNS, 1):
-        col_letter = get_column_letter(col_idx)
-        max_len = len(col_name)
-        for cell in ws[col_letter]:
-            try:
-                if cell.value:
-                    max_len = max(max_len, len(str(cell.value)))
-            except Exception:
-                pass
-        ws.column_dimensions[col_letter].width = min(max_len + 4, 60)
-
+    _autofit_columns(ws, COLUMNS)
     ws.freeze_panes = "A2"
+
+    # Sheet 2 — businesses with no website at all. CRAWL/VERIFY had nothing
+    # to work with for these, so they have no email; SOCIAL's Bing-search
+    # fallback (_find_social_no_website) is their only source of contact
+    # info besides the phone number already on file.
+    with get_conn(db_path) as conn:
+        no_website_rows = conn.execute(
+            """
+            SELECT business_name, phone, category, address,
+                   facebook_url, instagram_url, linkedin_url
+            FROM businesses
+            WHERE website_url IS NULL AND normalized_url IS NULL
+              AND niche = ? AND location = ?
+            ORDER BY business_name ASC
+            """,
+            (niche, location),
+        ).fetchall()
+
+    ws2 = wb.create_sheet("No Website")
+    ws2.append(NO_WEBSITE_COLUMNS)
+    _style_header(ws2)
+
+    for row in no_website_rows:
+        ws2.append(
+            [
+                row["business_name"],
+                row["phone"] or "",
+                row["category"] or "",
+                row["address"] or "",
+                row["facebook_url"] or "",
+                row["instagram_url"] or "",
+                row["linkedin_url"] or "",
+            ]
+        )
+
+    _autofit_columns(ws2, NO_WEBSITE_COLUMNS)
+    ws2.freeze_panes = "A2"
+
+    logger.info("[WRITE] %d businesses with no website written to sheet 'No Website'", len(no_website_rows))
 
     out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
