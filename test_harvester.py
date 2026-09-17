@@ -54,6 +54,15 @@ Tests for the Bing scraper and obfuscated-email regex fixes:
    href), so pattern-matching hrefs directly would never find anything even
    when Bing returns a correct result — _unwrap_bing_redirect decodes it
    first.
+10. email_harvester.write.run_write always built a brand-new
+    openpyxl.Workbook() and overwrote out_path unconditionally, so
+    re-running the tool against the same output file (a common workflow:
+    build one master leads list across several niche/location runs)
+    silently discarded every row written by earlier runs. Fixed to load
+    the existing workbook and append below the old data when the output
+    file already exists, deduping by email (Leads) / (name, phone)
+    (No Website) so re-running the *same* niche/location doesn't pile up
+    duplicates every time.
 
 No real network calls are made: httpx fetching and DNS resolution are
 monkeypatched out.
@@ -486,6 +495,206 @@ class WritePermissionErrorTests(unittest.TestCase):
         )
         self.assertEqual(result_path, out_path)
         self.assertTrue(Path(result_path).exists())
+
+
+class WriteNoWebsiteSheetTests(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self._tmpdir.name) / "test.db")
+        init_db(self.db_path)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_no_website_business_appears_only_on_sheet_2(self):
+        import openpyxl
+
+        with get_conn(self.db_path) as conn:
+            # Has a website + a verified email -> belongs on sheet 1 only.
+            biz_with_site = upsert_business(
+                conn, niche="plumber", location="Austin, TX",
+                business_name="Joe Plumbing", website_url="https://joe.com",
+                phone="555-1111", address="1 Main St", category="Plumbing",
+                source="yellowpages",
+            )
+            conn.execute("UPDATE businesses SET normalized_url=? WHERE id=?",
+                         ("https://joe.com", biz_with_site))
+            upsert_email(conn, business_id=biz_with_site, email="joe@joe.com",
+                         source_url=None, extract_method="mailto")
+            conn.execute(
+                "UPDATE emails SET tier='acceptable', mx_status='acceptable' WHERE business_id=?",
+                (biz_with_site,),
+            )
+
+            # No website at all -> belongs on sheet 2 only.
+            biz_no_site = upsert_business(
+                conn, niche="plumber", location="Austin, TX",
+                business_name="No Site Plumbing", website_url=None,
+                phone="555-2222", address="2 Side St", category="Plumbing",
+                source="bing",
+            )
+            upsert_social(
+                conn, business_id=biz_no_site,
+                facebook_url="https://facebook.com/nosite",
+                instagram_url="https://instagram.com/nosite",
+                linkedin_url=None,
+            )
+
+        out_path = str(Path(self._tmpdir.name) / "leads.xlsx")
+        write.run_write(
+            db_path=self.db_path, niche="plumber", location="Austin, TX",
+            out_path=out_path, suppress_path=None,
+        )
+
+        wb = openpyxl.load_workbook(out_path)
+        self.assertEqual(wb.sheetnames, ["Leads", "No Website"])
+
+        leads_names = [r[0] for r in wb["Leads"].iter_rows(min_row=2, values_only=True)]
+        self.assertIn("Joe Plumbing", leads_names)
+        self.assertNotIn("No Site Plumbing", leads_names)
+
+        no_site_rows = list(wb["No Website"].iter_rows(min_row=2, values_only=True))
+        self.assertEqual(len(no_site_rows), 1)
+        row = no_site_rows[0]
+        self.assertEqual(
+            row,
+            ("No Site Plumbing", "555-2222", "Plumbing", "2 Side St",
+             "https://facebook.com/nosite", "https://instagram.com/nosite", None),
+        )
+        self.assertEqual(wb["No Website"][1][0].value, "Company Name")
+
+    def test_no_website_sheet_header_styling_matches_sheet_1(self):
+        import openpyxl
+
+        out_path = str(Path(self._tmpdir.name) / "leads.xlsx")
+        write.run_write(
+            db_path=self.db_path, niche="plumber", location="Austin, TX",
+            out_path=out_path, suppress_path=None,
+        )
+        wb = openpyxl.load_workbook(out_path)
+        leads_header = wb["Leads"]["A1"]
+        no_site_header = wb["No Website"]["A1"]
+        self.assertEqual(no_site_header.fill.start_color.rgb, leads_header.fill.start_color.rgb)
+        self.assertEqual(no_site_header.font.bold, leads_header.font.bold)
+        self.assertEqual(no_site_header.font.color.rgb, leads_header.font.color.rgb)
+
+    def test_sheet_2_created_and_empty_when_no_such_businesses(self):
+        import openpyxl
+
+        out_path = str(Path(self._tmpdir.name) / "leads.xlsx")
+        write.run_write(
+            db_path=self.db_path, niche="plumber", location="Austin, TX",
+            out_path=out_path, suppress_path=None,
+        )
+        wb = openpyxl.load_workbook(out_path)
+        self.assertIn("No Website", wb.sheetnames)
+        ws2 = wb["No Website"]
+        self.assertEqual(ws2.max_row, 1)  # header only
+
+
+class WriteAppendModeTests(unittest.TestCase):
+    """Regression tests for the fix: run_write must append new rows below
+    whatever's already in out_path, never overwrite/discard it."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self._tmpdir.name) / "test.db")
+        self.out_path = str(Path(self._tmpdir.name) / "leads.xlsx")
+        init_db(self.db_path)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _add_lead(self, name: str, email: str) -> int:
+        with get_conn(self.db_path) as conn:
+            biz_id = upsert_business(
+                conn, niche="plumber", location="Austin, TX",
+                business_name=name, website_url=f"https://{name.lower()}.com",
+                phone="555-0000", address="1 Main St", category="Plumbing",
+                source="yellowpages",
+            )
+            conn.execute("UPDATE businesses SET normalized_url=website_url WHERE id=?", (biz_id,))
+            upsert_email(conn, business_id=biz_id, email=email,
+                         source_url=None, extract_method="mailto")
+            conn.execute(
+                "UPDATE emails SET tier='acceptable', mx_status='acceptable' WHERE business_id=?",
+                (biz_id,),
+            )
+        return biz_id
+
+    def _add_no_website(self, name: str) -> int:
+        with get_conn(self.db_path) as conn:
+            biz_id = upsert_business(
+                conn, niche="plumber", location="Austin, TX",
+                business_name=name, website_url=None,
+                phone="555-1111", address="2 Side St", category="Plumbing",
+                source="bing",
+            )
+            upsert_social(conn, business_id=biz_id,
+                          facebook_url=f"https://facebook.com/{name}",
+                          instagram_url=None, linkedin_url=None)
+        return biz_id
+
+    def test_second_run_preserves_old_rows_and_appends_new_ones(self):
+        import openpyxl
+
+        self._add_lead("Alpha Plumbing", "alpha@alpha.com")
+        write.run_write(db_path=self.db_path, niche="plumber", location="Austin, TX",
+                         out_path=self.out_path, suppress_path=None)
+
+        self._add_lead("Beta Plumbing", "beta@beta.com")
+        write.run_write(db_path=self.db_path, niche="plumber", location="Austin, TX",
+                         out_path=self.out_path, suppress_path=None)
+
+        wb = openpyxl.load_workbook(self.out_path)
+        names = [r[0] for r in wb["Leads"].iter_rows(min_row=2, values_only=True)]
+        self.assertEqual(names, ["Alpha Plumbing", "Beta Plumbing"])
+
+    def test_rerunning_same_query_does_not_duplicate_rows(self):
+        import openpyxl
+
+        self._add_lead("Alpha Plumbing", "alpha@alpha.com")
+        write.run_write(db_path=self.db_path, niche="plumber", location="Austin, TX",
+                         out_path=self.out_path, suppress_path=None)
+        # Re-run with no new data at all.
+        write.run_write(db_path=self.db_path, niche="plumber", location="Austin, TX",
+                         out_path=self.out_path, suppress_path=None)
+
+        wb = openpyxl.load_workbook(self.out_path)
+        names = [r[0] for r in wb["Leads"].iter_rows(min_row=2, values_only=True)]
+        self.assertEqual(names, ["Alpha Plumbing"])  # not duplicated
+
+    def test_no_website_sheet_also_preserves_and_appends(self):
+        import openpyxl
+
+        self._add_no_website("Old Co")
+        write.run_write(db_path=self.db_path, niche="plumber", location="Austin, TX",
+                         out_path=self.out_path, suppress_path=None)
+
+        self._add_no_website("New Co")
+        write.run_write(db_path=self.db_path, niche="plumber", location="Austin, TX",
+                         out_path=self.out_path, suppress_path=None)
+
+        wb = openpyxl.load_workbook(self.out_path)
+        names = [r[0] for r in wb["No Website"].iter_rows(min_row=2, values_only=True)]
+        self.assertEqual(names, ["Old Co", "New Co"])
+
+    def test_corrupt_existing_file_falls_back_to_fresh_workbook(self):
+        """If out_path exists but isn't a valid workbook, run_write must not
+        crash — it should log a warning and start fresh rather than losing
+        the run's results."""
+        Path(self.out_path).write_text("not a real xlsx file", encoding="utf-8")
+        self._add_lead("Alpha Plumbing", "alpha@alpha.com")
+
+        result_path = write.run_write(
+            db_path=self.db_path, niche="plumber", location="Austin, TX",
+            out_path=self.out_path, suppress_path=None,
+        )
+
+        import openpyxl
+        wb = openpyxl.load_workbook(result_path)
+        names = [r[0] for r in wb["Leads"].iter_rows(min_row=2, values_only=True)]
+        self.assertEqual(names, ["Alpha Plumbing"])
 
 
 # ---------------------------------------------------------------------------

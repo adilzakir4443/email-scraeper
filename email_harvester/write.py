@@ -201,6 +201,56 @@ def _autofit_columns(ws, columns: list[str]) -> None:
         ws.column_dimensions[col_letter].width = min(max_len + 4, 60)
 
 
+def _load_or_create_workbook(out_file: Path) -> "openpyxl.Workbook":
+    """
+    Open *out_file* to append to it if it already exists and is a valid
+    workbook; otherwise start a fresh one. Every run used to build a brand
+    new Workbook() and overwrite out_path unconditionally, so re-running the
+    tool against the same output file (a common workflow: build one master
+    leads list across several niche/location runs) silently discarded
+    everything written by earlier runs.
+    """
+    if out_file.exists():
+        try:
+            wb = openpyxl.load_workbook(str(out_file))
+            logger.info("[WRITE] Appending to existing workbook %s", out_file)
+            return wb
+        except Exception as exc:
+            logger.warning(
+                "[WRITE] Could not open existing %s as a workbook (%s) — "
+                "starting a new one instead", out_file, exc,
+            )
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)  # drop the auto-created default sheet; we name our own
+    return wb
+
+
+def _get_or_create_sheet(wb, title: str, columns: list[str]):
+    """Return (worksheet, is_new). A new sheet gets its header row + styling;
+    an existing one is returned as-is so new rows are appended after it."""
+    if title in wb.sheetnames:
+        return wb[title], False
+    ws = wb.create_sheet(title)
+    ws.append(columns)
+    _style_header(ws)
+    return ws, True
+
+
+def _existing_row_keys(ws, col_indices: list[int]) -> set[tuple]:
+    """
+    Read every existing data row (skipping the header) and return the set of
+    dedup keys built from the given 0-based column indices, so appending
+    doesn't re-add a row that's already in the sheet from a previous run.
+    """
+    keys: set[tuple] = set()
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row is None:
+            continue
+        key = tuple(str(row[i] or "").strip().lower() for i in col_indices)
+        keys.add(key)
+    return keys
+
+
 def run_write(
     db_path: str,
     niche: str,
@@ -276,17 +326,26 @@ def run_write(
         tier_counts.get("risky", 0),
     )
 
-    # Build Excel
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Leads"
+    # Build (or re-open) the Excel workbook
+    out_file = Path(out_path)
+    wb = _load_or_create_workbook(out_file)
+    ws, is_new_leads_sheet = _get_or_create_sheet(wb, "Leads", COLUMNS)
 
-    ws.append(COLUMNS)
-    _style_header(ws)
+    # Email (column index 4) identifies a lead — skip rows already in the
+    # sheet from an earlier run so re-running the same niche/location
+    # doesn't pile up duplicates every time.
+    existing_emails = set() if is_new_leads_sheet else _existing_row_keys(ws, [4])
 
     risky_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 
+    appended = 0
+    skipped_existing = 0
     for row in deduped:
+        email_key = (row["email"].strip().lower(),)
+        if email_key in existing_emails:
+            skipped_existing += 1
+            continue
+
         website = row["website"] or row["website_raw"] or ""
         comment = _build_comment(row)
 
@@ -311,6 +370,14 @@ def run_write(
             for cell in ws[ws.max_row]:
                 cell.fill = risky_fill
 
+        existing_emails.add(email_key)
+        appended += 1
+
+    logger.info(
+        "[WRITE] Leads sheet — appended %d new row(s), skipped %d already present",
+        appended, skipped_existing,
+    )
+
     _autofit_columns(ws, COLUMNS)
     ws.freeze_panes = "A2"
 
@@ -331,11 +398,20 @@ def run_write(
             (niche, location),
         ).fetchall()
 
-    ws2 = wb.create_sheet("No Website")
-    ws2.append(NO_WEBSITE_COLUMNS)
-    _style_header(ws2)
+    ws2, is_new_no_website_sheet = _get_or_create_sheet(wb, "No Website", NO_WEBSITE_COLUMNS)
 
+    # (Company Name, Phone) identifies a business here — there's no email to
+    # key on for this sheet — so a repeat run skips ones already listed.
+    existing_no_website = set() if is_new_no_website_sheet else _existing_row_keys(ws2, [0, 1])
+
+    no_website_appended = 0
+    no_website_skipped = 0
     for row in no_website_rows:
+        key = (str(row["business_name"] or "").strip().lower(), str(row["phone"] or "").strip().lower())
+        if key in existing_no_website:
+            no_website_skipped += 1
+            continue
+
         ws2.append(
             [
                 row["business_name"],
@@ -347,13 +423,17 @@ def run_write(
                 row["linkedin_url"] or "",
             ]
         )
+        existing_no_website.add(key)
+        no_website_appended += 1
 
     _autofit_columns(ws2, NO_WEBSITE_COLUMNS)
     ws2.freeze_panes = "A2"
 
-    logger.info("[WRITE] %d businesses with no website written to sheet 'No Website'", len(no_website_rows))
+    logger.info(
+        "[WRITE] No Website sheet — appended %d new row(s), skipped %d already present",
+        no_website_appended, no_website_skipped,
+    )
 
-    out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     try:
         wb.save(str(out_file))
@@ -373,7 +453,7 @@ def run_write(
         out_file = fallback
 
     logger.info(
-        "[WRITE] DONE — wrote %d leads to %s  (suppressed=%d)",
-        len(deduped), out_file, suppressed_count,
+        "[WRITE] DONE — %d new lead(s) appended to %s (total now %d)  (suppressed=%d)",
+        appended, out_file, ws.max_row - 1, suppressed_count,
     )
     return str(out_file)
