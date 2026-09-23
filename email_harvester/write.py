@@ -398,6 +398,28 @@ def run_write(
             (niche, location),
         ).fetchall()
 
+        # Debug aid: if this sheet is unexpectedly empty, this line makes it
+        # obvious whether the SQL genuinely found nothing for this niche/
+        # location (e.g. every discovered business really does have a site)
+        # versus a bug elsewhere (e.g. a scraper stashing a non-website URL
+        # in website_url, as the Yelp scraper used to do with its own
+        # listing-page link — see discover.py's _parse_yelp_listing).
+        total_for_query = conn.execute(
+            "SELECT COUNT(*) FROM businesses WHERE niche = ? AND location = ?",
+            (niche, location),
+        ).fetchone()[0]
+        with_site = conn.execute(
+            """SELECT COUNT(*) FROM businesses
+               WHERE niche = ? AND location = ?
+                 AND (website_url IS NOT NULL OR normalized_url IS NOT NULL)""",
+            (niche, location),
+        ).fetchone()[0]
+        logger.info(
+            "[WRITE] No Website query — %d raw row(s) before dedup "
+            "(of %d total businesses for this niche/location; %d have a site)",
+            len(no_website_rows), total_for_query, with_site,
+        )
+
     ws2, is_new_no_website_sheet = _get_or_create_sheet(wb, "No Website", NO_WEBSITE_COLUMNS)
 
     # (Company Name, Phone) identifies a business here — there's no email to
