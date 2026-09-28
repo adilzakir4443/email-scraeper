@@ -203,17 +203,17 @@ def _autofit_columns(ws, columns: list[str]) -> None:
 
 def _load_or_create_workbook(out_file: Path) -> "openpyxl.Workbook":
     """
-    Open *out_file* to append to it if it already exists and is a valid
-    workbook; otherwise start a fresh one. Every run used to build a brand
-    new Workbook() and overwrite out_path unconditionally, so re-running the
-    tool against the same output file (a common workflow: build one master
-    leads list across several niche/location runs) silently discarded
+    Open *out_file* to update it in place if it already exists and is a
+    valid workbook; otherwise start a fresh one. Every run used to build a
+    brand new Workbook() and overwrite out_path unconditionally, so
+    re-running the tool against the same output file (a common workflow:
+    build one master leads list, refreshed across runs) silently discarded
     everything written by earlier runs.
     """
     if out_file.exists():
         try:
             wb = openpyxl.load_workbook(str(out_file))
-            logger.info("[WRITE] Appending to existing workbook %s", out_file)
+            logger.info("[WRITE] Updating existing workbook %s", out_file)
             return wb
         except Exception as exc:
             logger.warning(
@@ -226,8 +226,10 @@ def _load_or_create_workbook(out_file: Path) -> "openpyxl.Workbook":
 
 
 def _get_or_create_sheet(wb, title: str, columns: list[str]):
-    """Return (worksheet, is_new). A new sheet gets its header row + styling;
-    an existing one is returned as-is so new rows are appended after it."""
+    """Return (worksheet, is_new). A new sheet gets its header row + styling
+    (an existing one already has both, so _style_header is skipped for it —
+    re-styling on every run would be wasted work and risks fighting any
+    manual tweaks the header row picked up)."""
     if title in wb.sheetnames:
         return wb[title], False
     ws = wb.create_sheet(title)
@@ -239,8 +241,8 @@ def _get_or_create_sheet(wb, title: str, columns: list[str]):
 def _existing_row_keys(ws, col_indices: list[int]) -> set[tuple]:
     """
     Read every existing data row (skipping the header) and return the set of
-    dedup keys built from the given 0-based column indices, so appending
-    doesn't re-add a row that's already in the sheet from a previous run.
+    dedup keys built from the given 0-based column indices, so writing
+    doesn't re-add a row that's already in the sheet.
     """
     keys: set[tuple] = set()
     for row in ws.iter_rows(min_row=2, values_only=True):
@@ -249,6 +251,71 @@ def _existing_row_keys(ws, col_indices: list[int]) -> set[tuple]:
         key = tuple(str(row[i] or "").strip().lower() for i in col_indices)
         keys.add(key)
     return keys
+
+
+def _clear_matching_rows(ws, col_indices: list[int], keys_to_clear: set[tuple]) -> int:
+    """
+    Delete every data row (skipping the header) whose values at
+    *col_indices* form a key in *keys_to_clear*. Used to refresh a single
+    niche+location's rows in place on a re-run — without this, either
+    stale rows from an old run would never be corrected (a business that
+    dropped a tier, changed phone, etc. would keep showing outdated data
+    forever), or a blunt "clear everything" would also wipe out rows
+    belonging to a *different* niche/location sharing the same output file.
+    Rows are deleted bottom-to-top so earlier deletions don't shift the
+    row indices of ones still to be checked. Returns the count deleted.
+    """
+    rows_to_delete = [
+        row_idx
+        for row_idx in range(2, ws.max_row + 1)
+        if tuple(
+            str(ws.cell(row=row_idx, column=col_idx + 1).value or "").strip().lower()
+            for col_idx in col_indices
+        ) in keys_to_clear
+    ]
+    for row_idx in reversed(rows_to_delete):
+        ws.delete_rows(row_idx, 1)
+    return len(rows_to_delete)
+
+
+def _is_file_locked(path: Path) -> bool:
+    """True if *path* exists and is currently open/locked elsewhere (e.g.
+    open in Excel, which holds an exclusive lock on Windows)."""
+    if not path.exists():
+        return False
+    try:
+        with open(path, "r+b"):
+            pass
+        return False
+    except PermissionError:
+        return True
+
+
+def _next_available_path(path: Path) -> Path:
+    """Return the first "<stem>_N<suffix>" path (N = 1, 2, 3, ...) that
+    isn't locked, starting from *path* itself."""
+    if not _is_file_locked(path):
+        return path
+    n = 1
+    while True:
+        candidate = path.with_name(f"{path.stem}_{n}{path.suffix}")
+        if not _is_file_locked(candidate):
+            return candidate
+        n += 1
+
+
+def _resolve_output_path(path: Path) -> Path:
+    """
+    If *path* doesn't exist or isn't locked, return it unchanged. If it's
+    open/locked elsewhere, return the next available "<stem>_N<suffix>"
+    path instead (checked proactively via _is_file_locked, since a plain
+    'r' open — what load_workbook itself would do — doesn't reliably fail
+    just because Excel has the file open for writing).
+    """
+    resolved = _next_available_path(path)
+    if resolved != path:
+        logger.warning("[WRITE] %s is open/locked — will save to %s instead", path, resolved)
+    return resolved
 
 
 def run_write(
@@ -326,14 +393,44 @@ def run_write(
         tier_counts.get("risky", 0),
     )
 
-    # Build (or re-open) the Excel workbook
-    out_file = Path(out_path)
+    # Build (or re-open) the Excel workbook. If out_path is already open in
+    # another program (e.g. Excel), write to "<stem>_1<suffix>" instead
+    # (then _2, _3, ... if those are locked too) rather than failing.
+    out_file = _resolve_output_path(Path(out_path))
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     wb = _load_or_create_workbook(out_file)
     ws, is_new_leads_sheet = _get_or_create_sheet(wb, "Leads", COLUMNS)
 
-    # Email (column index 4) identifies a lead — skip rows already in the
-    # sheet from an earlier run so re-running the same niche/location
-    # doesn't pile up duplicates every time.
+    # Refresh THIS niche+location's rows in place: clear whatever rows
+    # already belong to it (looked up by email, via the businesses table —
+    # not just "is this email in today's result set", so a row stays
+    # correctly identified as this niche/location's even if e.g. its tier
+    # changed and it no longer qualifies this run) before rewriting them
+    # below. Rows belonging to any OTHER niche/location already in this
+    # same output file are left completely untouched.
+    if not is_new_leads_sheet:
+        with get_conn(db_path) as conn:
+            owned_emails = {
+                r["email"].strip().lower()
+                for r in conn.execute(
+                    """SELECT e.email FROM emails e
+                       JOIN businesses b ON b.id = e.business_id
+                       WHERE b.niche = ? AND b.location = ?""",
+                    (niche, location),
+                ).fetchall()
+            }
+        if owned_emails:
+            cleared = _clear_matching_rows(ws, [4], {(e,) for e in owned_emails})
+            if cleared:
+                logger.info(
+                    "[WRITE] Leads sheet — cleared %d existing row(s) for "
+                    "niche=%r location=%r before rewriting",
+                    cleared, niche, location,
+                )
+
+    # Safety net against cross-niche email collisions — after the clear
+    # above, this is empty for the common case (this niche/location no
+    # longer has any rows left to collide with).
     existing_emails = set() if is_new_leads_sheet else _existing_row_keys(ws, [4])
 
     risky_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
@@ -422,8 +519,32 @@ def run_write(
 
     ws2, is_new_no_website_sheet = _get_or_create_sheet(wb, "No Website", NO_WEBSITE_COLUMNS)
 
+    # Same refresh-in-place approach as the Leads sheet above: clear rows
+    # already belonging to this niche+location (identified by every
+    # business currently on record for it, not just today's no-website
+    # ones — so a business that picked up a website since the last run
+    # correctly drops off this sheet instead of lingering as a stale row)
+    # before rewriting; other niches/locations in the file are untouched.
+    if not is_new_no_website_sheet:
+        with get_conn(db_path) as conn:
+            owned_no_website = {
+                (str(r["business_name"] or "").strip().lower(), str(r["phone"] or "").strip().lower())
+                for r in conn.execute(
+                    "SELECT business_name, phone FROM businesses WHERE niche = ? AND location = ?",
+                    (niche, location),
+                ).fetchall()
+            }
+        if owned_no_website:
+            cleared2 = _clear_matching_rows(ws2, [0, 1], owned_no_website)
+            if cleared2:
+                logger.info(
+                    "[WRITE] No Website sheet — cleared %d existing row(s) for "
+                    "niche=%r location=%r before rewriting",
+                    cleared2, niche, location,
+                )
+
     # (Company Name, Phone) identifies a business here — there's no email to
-    # key on for this sheet — so a repeat run skips ones already listed.
+    # key on for this sheet.
     existing_no_website = set() if is_new_no_website_sheet else _existing_row_keys(ws2, [0, 1])
 
     no_website_appended = 0
@@ -456,26 +577,31 @@ def run_write(
         no_website_appended, no_website_skipped,
     )
 
-    out_file.parent.mkdir(parents=True, exist_ok=True)
     try:
         wb.save(str(out_file))
     except PermissionError:
-        # Most commonly: the output file is already open in Excel, which
-        # holds an exclusive lock on Windows. All the scraping/verification
-        # work for this run is done and expensive to redo — don't throw it
-        # away over a locked file. Fall back to a timestamped path instead.
-        fallback = out_file.with_name(
-            f"{out_file.stem}_{datetime.now().strftime('%Y%m%d%H%M%S')}{out_file.suffix}"
-        )
+        # Race-condition safety net: the file passed the proactive
+        # _resolve_output_path check earlier but got opened in Excel (or
+        # similar) in the time since. All the scraping/verification work
+        # for this run is done and expensive to redo — don't throw it away
+        # over a locked file. Retry against "_1", "_2", ... using the save
+        # attempt itself as the lock check (more reliable here than the
+        # r+b pre-check, since that's exactly what just disagreed with it).
+        n = 1
+        while True:
+            fallback = out_file.with_name(f"{out_file.stem}_{n}{out_file.suffix}")
+            try:
+                wb.save(str(fallback))
+                break
+            except PermissionError:
+                n += 1
         logger.warning(
-            "[WRITE] %s is locked (likely open in Excel) — saving to %s instead",
-            out_file, fallback,
+            "[WRITE] %s is open/locked — saved to %s instead", out_file, fallback,
         )
-        wb.save(str(fallback))
         out_file = fallback
 
     logger.info(
-        "[WRITE] DONE — %d new lead(s) appended to %s (total now %d)  (suppressed=%d)",
-        appended, out_file, ws.max_row - 1, suppressed_count,
+        "[WRITE] DONE — %d new lead(s) in Leads (%d total now) to %s  (suppressed=%d)",
+        appended, ws.max_row - 1, out_file, suppressed_count,
     )
     return str(out_file)
