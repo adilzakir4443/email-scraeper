@@ -795,6 +795,75 @@ def _scrape_thomson_local(niche: str, location: str, max_results: int) -> Iterat
 
 
 # ---------------------------------------------------------------------------
+# Niche relevance filtering — a scraper can return listings that don't
+# actually match the requested niche (a directory site miscategorizing a
+# business, an aggressive local-pack match, etc.), so every source's
+# results get checked against the niche before being persisted.
+# ---------------------------------------------------------------------------
+
+_NICHE_SYNONYMS: dict[str, list[str]] = {
+    "plumber": ["plumber", "plumbing", "pipe", "drain", "sewer"],
+    "dentist": ["dentist", "dental", "orthodont", "teeth", "tooth"],
+    "lawyer": ["lawyer", "attorney", "law firm", "legal", "solicitor"],
+    "electrician": ["electrician", "electric", "electrical", "wiring"],
+    "restaurant": ["restaurant", "cafe", "diner", "eatery", "bistro", "grill"],
+    "accountant": ["accountant", "accounting", "bookkeep", "cpa", "tax"],
+}
+
+
+def _niche_keywords(niche: str) -> list[str]:
+    """
+    Return the keyword list to match a niche's businesses against. Checks
+    the synonym map first — matching either the exact word or its stripped
+    plural ("plumbers" -> "plumber" entry) — and falls back to the
+    niche string's own first-5-character stem for anything not mapped.
+    """
+    niche_lower = niche.lower().strip()
+    for word in re.findall(r"[a-z]+", niche_lower):
+        for candidate in (word, word.rstrip("s")):
+            if candidate in _NICHE_SYNONYMS:
+                return _NICHE_SYNONYMS[candidate]
+    stem = niche_lower[:5].strip()
+    return [stem] if stem else [niche_lower]
+
+
+def _is_relevant(
+    business_name: str | None, category: str | None, niche: str
+) -> tuple[bool, bool]:
+    """
+    Check whether a scraped listing plausibly matches the requested niche.
+
+    Returns (is_relevant, checked) rather than a bare bool, since the two
+    outcomes that both "keep the record" need to be distinguishable from
+    each other downstream (relevance_checked is persisted on the row):
+      - (True,  True)  — a niche keyword was found in the name or category:
+                          confidently relevant.
+      - (True,  False) — no category at all, and no keyword match in the
+                          name either: too little information to judge, so
+                          it's kept but flagged as unchecked/uncertain
+                          rather than silently dropped.
+      - (False, True)  — a category is present but doesn't match any niche
+                          keyword (e.g. niche=plumbers, category=restaurant)
+                          — treated as a contradiction and dropped. Simple
+                          keyword matching can't distinguish "genuinely
+                          contradicts" from "just an unmapped category
+                          wording", so any non-matching-but-present category
+                          is treated the same conservative way.
+    """
+    keywords = _niche_keywords(niche)
+    name_lower = (business_name or "").lower()
+    category_lower = (category or "").lower()
+
+    if any(kw in name_lower for kw in keywords) or any(kw in category_lower for kw in keywords):
+        return True, True
+
+    if not category_lower:
+        return True, False
+
+    return False, True
+
+
+# ---------------------------------------------------------------------------
 # Region detection — picks which directory sources are worth trying for a
 # given --location, since e.g. scraping Yell.com/Thomson Local for a US
 # address (or Yellow Pages US for a UK one) would just waste time on a
@@ -906,8 +975,16 @@ def run_discover(db_path: str, niche: str, location: str, max_results: int) -> N
 
         logger.info("[DISCOVER] Starting source: %s (budget=%d)", source_name, budget)
         count = 0
+        filtered = 0
         try:
             for biz in factory(niche, location, budget):
+                is_relevant, checked = _is_relevant(
+                    biz.get("business_name"), biz.get("category"), niche
+                )
+                if not is_relevant:
+                    filtered += 1
+                    continue
+
                 with get_conn(db_path) as conn:
                     upsert_business(
                         conn,
@@ -919,6 +996,7 @@ def run_discover(db_path: str, niche: str, location: str, max_results: int) -> N
                         address=biz.get("address"),
                         category=biz.get("category"),
                         source=biz["source"],
+                        relevance_checked=checked,
                     )
                 count += 1
                 total_inserted += 1
@@ -928,6 +1006,9 @@ def run_discover(db_path: str, niche: str, location: str, max_results: int) -> N
                 source_name, exc,
             )
             continue
+
+        if filtered:
+            logger.info("[DISCOVER] Filtered %d irrelevant results from %s", filtered, source_name)
 
         if count == 0:
             logger.warning("[DISCOVER] Source %s returned 0 results", source_name)

@@ -2,12 +2,16 @@
 Stage 4b — WRITE.
 
 Reads verified emails from SQLite, applies suppression list,
-deduplicates (by email then by domain), and writes an Excel file with two
-sheets:
-  "Leads"      — one row per verified email.
-  "No Website" — businesses with no site at all (nothing for CRAWL/VERIFY
-                 to work with), so their only follow-up contact is phone /
-                 social media, which SOCIAL's Bing-search fallback fills in.
+deduplicates (by email then by domain), and writes an Excel file with three
+sheets, each business landing in exactly one of them:
+  "Leads"                  — has a verified email (tier acceptable/risky).
+  "No Website"             — RESOLVE actually confirmed no site exists
+                              (resolve_status='no_site'), not just "hasn't
+                              been checked yet" — SOCIAL's Bing-search
+                              fallback is these businesses' only source of
+                              contact info besides phone.
+  "Has Website, No Email"  — has a site, CRAWL ran against it, but found no
+                              email at all; a manual-follow-up list.
 
 Sheet 1 columns (exact order):
   Company Name | Owner Name | Phone | Category | Email | Website |
@@ -15,6 +19,9 @@ Sheet 1 columns (exact order):
 
 Sheet 2 columns (exact order):
   Company Name | Phone | Category | Address | Facebook | Instagram | LinkedIn
+
+Sheet 3 columns (exact order):
+  Company Name | Phone | Category | Website | Address | Facebook | Instagram | LinkedIn
 
 Comment format:
   mx_status=acceptable; role=false; source=yellowpages
@@ -54,6 +61,17 @@ NO_WEBSITE_COLUMNS = [
     "Company Name",
     "Phone",
     "Category",
+    "Address",
+    "Facebook",
+    "Instagram",
+    "LinkedIn",
+]
+
+NO_EMAIL_COLUMNS = [
+    "Company Name",
+    "Phone",
+    "Category",
+    "Website",
     "Address",
     "Facebook",
     "Instagram",
@@ -364,6 +382,7 @@ def run_write(
             JOIN businesses b ON b.id = e.business_id
             WHERE b.niche = ? AND b.location = ?
               AND e.tier IN ('acceptable', 'risky')
+              AND e.email IS NOT NULL AND e.email != ''
             ORDER BY e.tier ASC, b.business_name ASC
             """,
             (niche, location),
@@ -478,8 +497,11 @@ def run_write(
     _autofit_columns(ws, COLUMNS)
     ws.freeze_panes = "A2"
 
-    # Sheet 2 — businesses with no website at all. CRAWL/VERIFY had nothing
-    # to work with for these, so they have no email; SOCIAL's Bing-search
+    # Sheet 2 — businesses RESOLVE actually confirmed have no website
+    # (resolve_status='no_site', not just "missing/not checked yet" — RESOLVE
+    # now does one more Bing-search pass before ever setting that status, so
+    # this reflects a real confirmed absence). CRAWL/VERIFY had nothing to
+    # work with for these, so they have no email; SOCIAL's Bing-search
     # fallback (_find_social_no_website) is their only source of contact
     # info besides the phone number already on file.
     with get_conn(db_path) as conn:
@@ -489,6 +511,7 @@ def run_write(
                    facebook_url, instagram_url, linkedin_url
             FROM businesses
             WHERE website_url IS NULL AND normalized_url IS NULL
+              AND resolve_status = 'no_site'
               AND niche = ? AND location = ?
             ORDER BY business_name ASC
             """,
@@ -575,6 +598,87 @@ def run_write(
     logger.info(
         "[WRITE] No Website sheet — appended %d new row(s), skipped %d already present",
         no_website_appended, no_website_skipped,
+    )
+
+    # Sheet 3 — has a website, CRAWL actually ran against it (excludes ones
+    # still crawl_status='pending', which just haven't been processed yet
+    # and would otherwise misleadingly look like "checked, found nothing"),
+    # but zero emails were found at all. A manual-follow-up list, distinct
+    # from "No Website" — these businesses DO have a site, just no email.
+    with get_conn(db_path) as conn:
+        no_email_rows = conn.execute(
+            """
+            SELECT business_name, phone, category, address,
+                   normalized_url AS website, website_url AS website_raw,
+                   facebook_url, instagram_url, linkedin_url
+            FROM businesses b
+            WHERE (website_url IS NOT NULL OR normalized_url IS NOT NULL)
+              AND crawl_status != 'pending'
+              AND niche = ? AND location = ?
+              AND NOT EXISTS (SELECT 1 FROM emails e WHERE e.business_id = b.id)
+            ORDER BY business_name ASC
+            """,
+            (niche, location),
+        ).fetchall()
+
+    ws3, is_new_no_email_sheet = _get_or_create_sheet(wb, "Has Website, No Email", NO_EMAIL_COLUMNS)
+
+    # Same refresh-in-place approach as Sheets 1 and 2.
+    if not is_new_no_email_sheet:
+        with get_conn(db_path) as conn:
+            owned_no_email = {
+                (str(r["business_name"] or "").strip().lower(), str(r["phone"] or "").strip().lower())
+                for r in conn.execute(
+                    "SELECT business_name, phone FROM businesses WHERE niche = ? AND location = ?",
+                    (niche, location),
+                ).fetchall()
+            }
+        if owned_no_email:
+            cleared3 = _clear_matching_rows(ws3, [0, 1], owned_no_email)
+            if cleared3:
+                logger.info(
+                    "[WRITE] Has Website, No Email sheet — cleared %d existing row(s) for "
+                    "niche=%r location=%r before rewriting",
+                    cleared3, niche, location,
+                )
+
+    existing_no_email = set() if is_new_no_email_sheet else _existing_row_keys(ws3, [0, 1])
+
+    no_email_appended = 0
+    no_email_skipped = 0
+    for row in no_email_rows:
+        key = (str(row["business_name"] or "").strip().lower(), str(row["phone"] or "").strip().lower())
+        if key in existing_no_email:
+            no_email_skipped += 1
+            continue
+
+        website = row["website"] or row["website_raw"] or ""
+        ws3.append(
+            [
+                row["business_name"],
+                row["phone"] or "",
+                row["category"] or "",
+                website,
+                row["address"] or "",
+                row["facebook_url"] or "",
+                row["instagram_url"] or "",
+                row["linkedin_url"] or "",
+            ]
+        )
+        existing_no_email.add(key)
+        no_email_appended += 1
+
+    _autofit_columns(ws3, NO_EMAIL_COLUMNS)
+    ws3.freeze_panes = "A2"
+
+    logger.info(
+        "[WRITE] Has Website, No Email sheet — appended %d new row(s), skipped %d already present",
+        no_email_appended, no_email_skipped,
+    )
+
+    logger.info(
+        "[WRITE] Sheet1 leads=%d Sheet2 no_website=%d Sheet3 has_site_no_email=%d",
+        ws.max_row - 1, ws2.max_row - 1, ws3.max_row - 1,
     )
 
     try:

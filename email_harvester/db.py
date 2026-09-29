@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS businesses (
     instagram_url    TEXT,
     linkedin_url     TEXT,
     social_status    TEXT    DEFAULT 'pending',  -- pending | done
+    relevance_checked INTEGER DEFAULT 1,         -- 0 = kept but unconfirmed (no category, no name match)
     UNIQUE(niche, location, business_name, source)
 );
 
@@ -66,6 +67,7 @@ _BUSINESS_COLUMN_MIGRATIONS: dict[str, str] = {
     "instagram_url": "ALTER TABLE businesses ADD COLUMN instagram_url TEXT",
     "linkedin_url":  "ALTER TABLE businesses ADD COLUMN linkedin_url TEXT",
     "social_status": "ALTER TABLE businesses ADD COLUMN social_status TEXT DEFAULT 'pending'",
+    "relevance_checked": "ALTER TABLE businesses ADD COLUMN relevance_checked INTEGER DEFAULT 1",
 }
 
 
@@ -126,15 +128,18 @@ def upsert_business(
     address: str | None,
     category: str | None,
     source: str,
+    relevance_checked: bool = True,
 ) -> int:
     """Insert or ignore a business row; return its id."""
     conn.execute(
         """
         INSERT OR IGNORE INTO businesses
-            (niche, location, business_name, website_url, phone, address, category, source)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (niche, location, business_name, website_url, phone, address, category,
+             source, relevance_checked)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (niche, location, business_name, website_url, phone, address, category, source),
+        (niche, location, business_name, website_url, phone, address, category,
+         source, int(relevance_checked)),
     )
     row = conn.execute(
         "SELECT id FROM businesses WHERE niche=? AND location=? AND business_name=? AND source=?",
