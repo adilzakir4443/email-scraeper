@@ -189,10 +189,21 @@ def _search_website_via_bing(business_name: str, location: str) -> Optional[str]
     return None
 
 
-def run_resolve(db_path: str) -> None:
+def run_resolve(
+    db_path: str,
+    api_fallback: bool = False,
+    google_api_key: str | None = None,
+    google_cx: str | None = None,
+) -> None:
     """
     Stage 2: normalise all pending website URLs.
     Already-resolved rows are skipped automatically.
+
+    If the Bing search-fallback above finds nothing AND api_fallback is set
+    AND Google API keys are configured, a Google Custom Search Engine query
+    is tried as one more attempt before marking the business no_site. This
+    never runs otherwise — it costs real API quota, so it only kicks in
+    once the free path has genuinely come up empty.
     """
     logger.info("=== STAGE 2: RESOLVE ===")
 
@@ -220,6 +231,11 @@ def run_resolve(db_path: str) -> None:
         location = row["location"]
 
         found_url = _search_website_via_bing(name, location)
+
+        if found_url is None and api_fallback and google_api_key and google_cx:
+            from .google_api import find_website_via_cse
+            found_url = find_website_via_cse(name, location, google_api_key, google_cx)
+
         with get_conn(db_path) as conn:
             if found_url:
                 conn.execute("UPDATE businesses SET website_url=? WHERE id=?", (found_url, biz_id))

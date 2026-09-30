@@ -9,6 +9,7 @@ the last completed point in SQLite.
 """
 
 import logging
+import os
 import sys
 from typing import Optional
 
@@ -46,6 +47,9 @@ def _configure_logging(verbose: bool) -> None:
               help="Comma-separated proxy URLs (overrides PROXY_POOL env var)")
 @click.option("--enrich",   "enrich_path",  default=None,
               help="Path to existing Excel file to enrich with missing data")
+@click.option("--api-fallback", "api_fallback", is_flag=True, default=False,
+              help="Use Google API as fallback when proxies fail (needs GOOGLE_API_KEY/"
+                   "GOOGLE_PLACES_KEY/GOOGLE_CX in .env — costs real API quota)")
 @click.option("--stage",    "stage",        default="all",
               type=click.Choice(["all", "discover", "resolve", "crawl", "social", "verify", "write"],
                                 case_sensitive=False),
@@ -62,6 +66,7 @@ def main(
     suppress_path: Optional[str],
     proxy_pool: Optional[str],
     enrich_path: Optional[str],
+    api_fallback: bool,
     stage: str,
     verbose: bool,
 ) -> None:
@@ -80,6 +85,11 @@ def main(
     columns on an existing spreadsheet instead of running the normal
     DISCOVER..WRITE pipeline. Example:
         email-harvester --enrich my_leads.xlsx --niche "plumbers" --location "Austin, TX"
+
+    --api-fallback only ever activates when the proxy-based path has already
+    come back empty — never as a routine supplement to it, so API quota is
+    never spent while proxies are working. Example:
+        email-harvester --niche "plumbers" --location "Austin, TX" --api-fallback
     """
     _configure_logging(verbose)
     logger = logging.getLogger(__name__)
@@ -94,6 +104,17 @@ def main(
     # Initialise DB schema
     from .db import init_db
     init_db(db_path)
+
+    # Google API fallback keys — read from environment (.env), never hardcoded.
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+    google_places_key = os.getenv("GOOGLE_PLACES_KEY") or google_api_key
+    google_cx = os.getenv("GOOGLE_CX")
+
+    if api_fallback and not google_api_key:
+        logger.warning(
+            "--api-fallback set but GOOGLE_API_KEY not found in environment — fallback disabled"
+        )
+        api_fallback = False
 
     if enrich_path:
         from .enrich import run_enrich
@@ -117,11 +138,17 @@ def main(
 
     if stage in ("all", "discover"):
         from .discover import run_discover
-        run_discover(db_path, niche, location, max_results)
+        run_discover(
+            db_path, niche, location, max_results,
+            api_fallback=api_fallback, google_places_key=google_places_key,
+        )
 
     if stage in ("all", "resolve"):
         from .resolve import run_resolve
-        run_resolve(db_path)
+        run_resolve(
+            db_path,
+            api_fallback=api_fallback, google_api_key=google_api_key, google_cx=google_cx,
+        )
 
     if stage in ("all", "crawl"):
         from .crawl import run_crawl
@@ -129,7 +156,10 @@ def main(
 
     if stage in ("all", "social"):
         from .social import run_social
-        run_social(db_path)
+        run_social(
+            db_path,
+            api_fallback=api_fallback, google_api_key=google_api_key, google_cx=google_cx,
+        )
 
     if stage in ("all", "verify"):
         from .verify import run_verify

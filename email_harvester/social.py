@@ -229,10 +229,21 @@ def _extract_from_website(site_url: str) -> dict[str, str | None]:
     return result
 
 
-def _bing_search_social(business_name: str, location: str, platform: str) -> str | None:
+def _bing_search_social(
+    business_name: str,
+    location: str,
+    platform: str,
+    api_fallback: bool = False,
+    google_api_key: str | None = None,
+    google_cx: str | None = None,
+) -> str | None:
     """
     Search Bing for business_name + location restricted to *platform*'s
     domain (via site:) and return the first matching organic-result link.
+    Falls back to a Google Custom Search Engine query if Bing turns up
+    nothing AND the caller has opted into --api-fallback with API keys
+    configured — this is never tried otherwise, since it costs real API
+    quota that a working Bing search doesn't.
     """
     pool = get_pool()
     proxy = pool.get()
@@ -240,50 +251,71 @@ def _bing_search_social(business_name: str, location: str, platform: str) -> str
     domain = _PLATFORM_DOMAINS[platform]
     pattern = _PLATFORM_PATTERNS[platform]
 
+    def _valid(candidate: str) -> bool:
+        return not (platform == "facebook" and _is_ignored_fb_path(candidate))
+
     query = urllib.parse.quote_plus(f"{business_name} {location} site:{domain}")
     url = f"https://www.bing.com/search?q={query}"
 
     with _make_client(proxy) as client:
         html = _fetch(client, url)
 
-    if not html:
-        return None
+    if html:
+        soup = BeautifulSoup(html, "lxml")
+        for result in soup.select("li.b_algo"):
+            link = result.select_one("h2 a[href]")
+            if not link:
+                continue
+            real_url = _unwrap_bing_redirect(link["href"])
+            if pattern.search(real_url) and _valid(real_url):
+                return real_url
 
-    def _valid(candidate: str) -> bool:
-        return not (platform == "facebook" and _is_ignored_fb_path(candidate))
+            # The href may not have decoded cleanly (format drift, ad slot,
+            # etc.) — fall back to reconstructing from the visible URL
+            # breadcrumb, which shows the real domain even when the href
+            # doesn't.
+            cite = result.select_one("cite")
+            if cite:
+                reconstructed = _reconstruct_from_cite(cite.get_text(), domain)
+                if reconstructed and pattern.search(reconstructed) and _valid(reconstructed):
+                    return reconstructed
 
-    soup = BeautifulSoup(html, "lxml")
-    for result in soup.select("li.b_algo"):
-        link = result.select_one("h2 a[href]")
-        if not link:
-            continue
-        real_url = _unwrap_bing_redirect(link["href"])
-        if pattern.search(real_url) and _valid(real_url):
-            return real_url
-
-        # The href may not have decoded cleanly (format drift, ad slot,
-        # etc.) — fall back to reconstructing from the visible URL
-        # breadcrumb, which shows the real domain even when the href doesn't.
-        cite = result.select_one("cite")
-        if cite:
-            reconstructed = _reconstruct_from_cite(cite.get_text(), domain)
-            if reconstructed and pattern.search(reconstructed) and _valid(reconstructed):
-                return reconstructed
+    if api_fallback and google_api_key and google_cx:
+        from .google_api import google_custom_search
+        cse_query = f'"{business_name}" "{location}" {platform}'
+        for item in google_custom_search(cse_query, google_api_key, google_cx):
+            link = item.get("link", "")
+            if link and pattern.search(link) and _valid(link):
+                return link
 
     return None
 
 
-def _find_social_no_website(business_name: str, location: str) -> dict[str, str | None]:
-    """Search Bing for all three platforms — used when a business has no
-    website, or its website yielded no social links."""
+def _find_social_no_website(
+    business_name: str,
+    location: str,
+    api_fallback: bool = False,
+    google_api_key: str | None = None,
+    google_cx: str | None = None,
+) -> dict[str, str | None]:
+    """Search Bing (with an optional Google CSE fallback) for all three
+    platforms — used when a business has no website, or its website
+    yielded no social links."""
     result: dict[str, str | None] = {}
     for platform in ("facebook", "instagram", "linkedin"):
-        result[platform] = _bing_search_social(business_name, location, platform)
+        result[platform] = _bing_search_social(
+            business_name, location, platform, api_fallback, google_api_key, google_cx
+        )
         time.sleep(random.uniform(1.0, 2.0))
     return result
 
 
-def run_social(db_path: str) -> None:
+def run_social(
+    db_path: str,
+    api_fallback: bool = False,
+    google_api_key: str | None = None,
+    google_cx: str | None = None,
+) -> None:
     """
     Stage 3b: find Facebook/Instagram/LinkedIn links for each business.
     Skips businesses whose social_status is already 'done'.
@@ -316,7 +348,9 @@ def run_social(db_path: str) -> None:
         try:
             social = _extract_from_website(site_url) if site_url else None
             if not social or not any(social.values()):
-                social = _find_social_no_website(business_name, location)
+                social = _find_social_no_website(
+                    business_name, location, api_fallback, google_api_key, google_cx
+                )
         except Exception as exc:
             logger.error("[SOCIAL] Unhandled error for %s: %s", business_name, exc)
             social = {"facebook": None, "instagram": None, "linkedin": None}

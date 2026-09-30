@@ -946,7 +946,14 @@ _REGION_SOURCES: dict[str, list[str]] = {
 _ALL_SOURCES = ["yellowpages", "bing", "yelp", "yellowpages_ca", "yell_uk", "thomson_local", "google_maps"]
 
 
-def run_discover(db_path: str, niche: str, location: str, max_results: int) -> None:
+def run_discover(
+    db_path: str,
+    niche: str,
+    location: str,
+    max_results: int,
+    api_fallback: bool = False,
+    google_places_key: str | None = None,
+) -> None:
     """
     Stage 1: scrape directories and populate the businesses table.
     Already-scraped businesses (same name+source) are silently skipped.
@@ -957,6 +964,12 @@ def run_discover(db_path: str, niche: str, location: str, max_results: int) -> N
     US for a London one); anything else runs every source. Each source is
     independent — if one fails outright or returns nothing, that's logged
     and the rest still run; a single bad scraper can't take down the stage.
+
+    If every proxy-based source still comes back with nothing AND
+    api_fallback is set AND a Google Places API key is configured, Google
+    Places is tried as a last resort. This never runs otherwise — it costs
+    real API quota, so it's only for when the free path has genuinely
+    failed, not a routine supplement to it.
     """
     region = _detect_region(location)
     source_names = _REGION_SOURCES.get(region, _ALL_SOURCES)
@@ -1014,6 +1027,38 @@ def run_discover(db_path: str, niche: str, location: str, max_results: int) -> N
             logger.warning("[DISCOVER] Source %s returned 0 results", source_name)
 
         logger.info("[DISCOVER] %s: inserted/seen %d businesses", source_name, count)
+
+    if total_inserted == 0 and api_fallback and google_places_key:
+        logger.info("[DISCOVER] All proxy sources failed — trying Google Places API fallback")
+        from .google_api import google_places_search
+
+        fallback_count = 0
+        try:
+            for biz in google_places_search(niche, location, google_places_key, max_results):
+                is_relevant, checked = _is_relevant(
+                    biz.get("business_name"), biz.get("category"), niche
+                )
+                if not is_relevant:
+                    continue
+                with get_conn(db_path) as conn:
+                    upsert_business(
+                        conn,
+                        niche=niche,
+                        location=location,
+                        business_name=biz["business_name"],
+                        website_url=biz.get("website_url"),
+                        phone=biz.get("phone"),
+                        address=biz.get("address"),
+                        category=biz.get("category"),
+                        source=biz["source"],
+                        relevance_checked=checked,
+                    )
+                fallback_count += 1
+                total_inserted += 1
+        except Exception as exc:
+            logger.warning("[DISCOVER] Google Places fallback failed: %s", exc)
+
+        logger.info("[DISCOVER] Google Places fallback added %d businesses", fallback_count)
 
     with get_conn(db_path) as conn:
         counts = count_businesses(conn, niche, location)
