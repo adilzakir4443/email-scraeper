@@ -57,11 +57,17 @@ def _politeness_sleep() -> None:
 
 def _make_client(proxy: str | None) -> httpx.Client:
     proxies = {"http://": proxy, "https://": proxy} if proxy else None
+    # Manually attach Proxy-Authorization too — httpx/httpcore normally
+    # derive it from the proxy URL's own credentials, but this is cheap
+    # insurance against the specific httpx versions/edge cases that drop it
+    # on an HTTPS CONNECT tunnel.
+    auth_header = get_pool().get_auth_header(proxy)
     return httpx.Client(
         proxies=proxies,
         follow_redirects=True,
         timeout=httpx.Timeout(30.0),
         verify=True,
+        headers=auth_header or None,
     )
 
 
@@ -69,12 +75,18 @@ def _make_client(proxy: str | None) -> httpx.Client:
 # Retry decorator for transient network errors
 # ---------------------------------------------------------------------------
 
-def _fetch_with_retry(client: httpx.Client, url: str, attempt: int = 0) -> httpx.Response | None:
+def _fetch_with_retry(
+    client: httpx.Client, url: str, attempt: int = 0, proxy: str | None = None
+) -> httpx.Response | None:
     """GET url; return Response or None on unrecoverable failure."""
     pool = get_pool()
     for i in range(4):
         try:
             resp = client.get(url, headers=_random_headers())
+            if resp.status_code == 407:
+                pool.mark_407(proxy)
+                logger.warning("407 Proxy Auth failed for %s — check proxy credentials", url)
+                break  # don't retry 407 — it won't fix itself with the same proxy
             if resp.status_code in (403, 429, 503):
                 logger.warning("HTTP %d for %s (attempt %d)", resp.status_code, url, i)
                 pool.backoff_sleep(i + 1)
@@ -143,7 +155,7 @@ def _scrape_yellowpages(niche: str, location: str, max_results: int) -> Iterator
 
         proxy = pool.get()
         with _make_client(proxy) as client:
-            resp = _fetch_with_retry(client, url)
+            resp = _fetch_with_retry(client, url, proxy=proxy)
 
         if resp is None or resp.status_code != 200:
             logger.warning("[YP] No valid response for page %d, stopping.", page)
@@ -228,7 +240,7 @@ def _scrape_bing(niche: str, location: str, max_results: int) -> Iterator[dict]:
 
         proxy = pool.get()
         with _make_client(proxy) as client:
-            resp = _fetch_with_retry(client, url)
+            resp = _fetch_with_retry(client, url, proxy=proxy)
 
         if resp is None or resp.status_code != 200:
             logger.warning("[Bing] No valid response at first=%d, stopping.", first)
@@ -323,7 +335,7 @@ def _scrape_yelp(niche: str, location: str, max_results: int) -> Iterator[dict]:
 
         proxy = pool.get()
         with _make_client(proxy) as client:
-            resp = _fetch_with_retry(client, url)
+            resp = _fetch_with_retry(client, url, proxy=proxy)
 
         if resp is None or resp.status_code != 200:
             logger.warning("[Yelp] No valid response at start=%d, stopping.", start)
@@ -578,7 +590,7 @@ def _scrape_yellowpages_ca(niche: str, location: str, max_results: int) -> Itera
 
         proxy = pool.get()
         with _make_client(proxy) as client:
-            resp = _fetch_with_retry(client, url)
+            resp = _fetch_with_retry(client, url, proxy=proxy)
 
         if resp is None or resp.status_code != 200:
             logger.warning("[YP-CA] No valid response for page %d, stopping.", page)
@@ -673,7 +685,7 @@ def _scrape_yell(niche: str, location: str, max_results: int) -> Iterator[dict]:
 
         proxy = pool.get()
         with _make_client(proxy) as client:
-            resp = _fetch_with_retry(client, url)
+            resp = _fetch_with_retry(client, url, proxy=proxy)
 
         if resp is None or resp.status_code != 200:
             logger.warning("[Yell] No valid response for page %d, stopping.", page)
@@ -764,7 +776,7 @@ def _scrape_thomson_local(niche: str, location: str, max_results: int) -> Iterat
 
         proxy = pool.get()
         with _make_client(proxy) as client:
-            resp = _fetch_with_retry(client, url)
+            resp = _fetch_with_retry(client, url, proxy=proxy)
 
         if resp is None or resp.status_code != 200:
             logger.warning("[ThomsonLocal] No valid response for page %d, stopping.", page)

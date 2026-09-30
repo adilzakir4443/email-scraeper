@@ -72,21 +72,27 @@ def _random_headers() -> dict[str, str]:
 
 def _make_client(proxy: str | None) -> httpx.Client:
     proxies = {"http://": proxy, "https://": proxy} if proxy else None
+    headers = _random_headers()
+    headers.update(get_pool().get_auth_header(proxy))
     return httpx.Client(
         proxies=proxies,
         follow_redirects=True,
         timeout=httpx.Timeout(20.0),
         verify=True,
-        headers=_random_headers(),
+        headers=headers,
     )
 
 
-def _fetch(client: httpx.Client, url: str) -> str | None:
+def _fetch(client: httpx.Client, url: str, proxy: str | None = None) -> str | None:
     """Fetch a single page and return its HTML, or None on error."""
     pool = get_pool()
     for attempt in range(3):
         try:
             resp = client.get(url)
+            if resp.status_code == 407:
+                pool.mark_407(proxy)
+                logger.warning("407 Proxy Auth failed for %s — check proxy credentials", url)
+                return None  # don't retry 407 — it won't fix itself with the same proxy
             if resp.status_code in (403, 429):
                 logger.debug("HTTP %d for %s (attempt %d)", resp.status_code, url, attempt)
                 pool.backoff_sleep(attempt + 1)
@@ -215,7 +221,7 @@ def _extract_from_website(site_url: str) -> dict[str, str | None]:
 
     with _make_client(proxy) as client:
         for page_url in pages:
-            html = _fetch(client, page_url)
+            html = _fetch(client, page_url, proxy=proxy)
             if not html:
                 continue
             found = _extract_social_from_html(html)
@@ -258,7 +264,7 @@ def _bing_search_social(
     url = f"https://www.bing.com/search?q={query}"
 
     with _make_client(proxy) as client:
-        html = _fetch(client, url)
+        html = _fetch(client, url, proxy=proxy)
 
     if html:
         soup = BeautifulSoup(html, "lxml")

@@ -60,12 +60,14 @@ def _random_headers() -> dict[str, str]:
 
 def _make_client(proxy: str | None) -> httpx.Client:
     proxies = {"http://": proxy, "https://": proxy} if proxy else None
+    headers = _random_headers()
+    headers.update(get_pool().get_auth_header(proxy))
     return httpx.Client(
         proxies=proxies,
         follow_redirects=True,
         timeout=httpx.Timeout(20.0),
         verify=True,
-        headers=_random_headers(),
+        headers=headers,
     )
 
 
@@ -96,12 +98,16 @@ def _absolute(href: str, base_url: str) -> str | None:
         return None
 
 
-def _fetch_page(client: httpx.Client, url: str) -> Optional[str]:
+def _fetch_page(client: httpx.Client, url: str, proxy: str | None = None) -> Optional[str]:
     """Fetch a single page and return its HTML, or None on error."""
     pool = get_pool()
     for attempt in range(3):
         try:
             resp = client.get(url)
+            if resp.status_code == 407:
+                pool.mark_407(proxy)
+                logger.warning("407 Proxy Auth failed for %s — check proxy credentials", url)
+                return None  # don't retry 407 — it won't fix itself with the same proxy
             if resp.status_code in (403, 429):
                 logger.warning("HTTP %d for %s (attempt %d)", resp.status_code, url, attempt)
                 pool.backoff_sleep(attempt + 1)
@@ -156,7 +162,7 @@ def _crawl_site_static(base_url: str) -> tuple[list[dict], list[str], dict]:
 
     with _make_client(proxy) as client:
         # Homepage first
-        html = _fetch_page(client, base_url)
+        html = _fetch_page(client, base_url, proxy=proxy)
         if html is None:
             return [], [], social
 
@@ -187,7 +193,7 @@ def _crawl_site_static(base_url: str) -> tuple[list[dict], list[str], dict]:
         # Visit each sub-page
         for page_url in to_visit[:MAX_PAGES_PER_SITE]:
             time.sleep(random.uniform(0.5, 1.5))  # intra-site politeness
-            sub_html = _fetch_page(client, page_url)
+            sub_html = _fetch_page(client, page_url, proxy=proxy)
             if sub_html is None:
                 continue
             pages_visited.append(page_url)

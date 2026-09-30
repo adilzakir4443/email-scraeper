@@ -81,6 +81,7 @@ def _resolve_one(url: str) -> Optional[str]:
     pool = get_pool()
     proxy = pool.get()
     proxies = {"http://": proxy, "https://": proxy} if proxy else None
+    auth_header = pool.get_auth_header(proxy)
 
     for attempt in range(3):
         try:
@@ -90,6 +91,7 @@ def _resolve_one(url: str) -> Optional[str]:
                 max_redirects=5,
                 timeout=httpx.Timeout(15.0),
                 verify=True,
+                headers=auth_header or None,
             ) as client:
                 resp = client.head(url, headers={
                     "User-Agent": "Mozilla/5.0 (compatible; EmailHarvester/1.0)",
@@ -99,6 +101,10 @@ def _resolve_one(url: str) -> Optional[str]:
                     resp = client.get(url, headers={
                         "User-Agent": "Mozilla/5.0 (compatible; EmailHarvester/1.0)",
                     })
+                if resp.status_code == 407:
+                    pool.mark_407(proxy)
+                    logger.warning("407 Proxy Auth failed for %s — check proxy credentials", url)
+                    break  # don't retry 407 — it won't fix itself with the same proxy
                 final_url = str(resp.url)
                 if proxy:
                     pool.report_success(proxy)
@@ -158,7 +164,7 @@ def _search_website_via_bing(business_name: str, location: str) -> Optional[str]
     url = f"https://www.bing.com/search?q={query}"
 
     with _make_client(proxy) as client:
-        html = _fetch(client, url)
+        html = _fetch(client, url, proxy=proxy)
     if not html:
         return None
 

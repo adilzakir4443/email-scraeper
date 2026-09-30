@@ -14,9 +14,42 @@ import sys
 from typing import Optional
 
 import click
+import httpx
 from dotenv import load_dotenv
 
 load_dotenv()  # pick up .env if present (PROXY_POOL, etc.)
+
+
+def _test_proxy_connectivity(pool) -> bool:
+    """Test one proxy against a reliable endpoint before the real run starts,
+    so a bad PROXY_POOL entry surfaces as one clear message instead of as a
+    wall of per-source 407s once DISCOVER is already underway."""
+    proxy = pool.get()
+    if not proxy:
+        return True  # no proxies configured, fine
+
+    logger = logging.getLogger(__name__)
+    try:
+        proxies = {"http://": proxy, "https://": proxy}
+        headers = {"User-Agent": "Mozilla/5.0", **pool.get_auth_header(proxy)}
+        with httpx.Client(proxies=proxies, timeout=10.0, headers=headers) as client:
+            resp = client.get("http://httpbin.org/ip")
+            if resp.status_code == 200:
+                logger.info("[PROXY] Test passed — proxy is working")
+                return True
+            elif resp.status_code == 407:
+                pool.mark_407(proxy)
+                logger.error(
+                    "[PROXY] 407 on proxy test — credentials invalid. "
+                    "Check PROXY_POOL format: http://user:pass@host:port"
+                )
+                return False
+            else:
+                logger.warning("[PROXY] Test returned HTTP %d", resp.status_code)
+                return False
+    except Exception as exc:
+        logger.warning("[PROXY] Test failed: %s", exc)
+        return False
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -104,6 +137,9 @@ def main(
         proxy_mod.init_pool([p.strip() for p in proxy_pool.split(",") if p.strip()])
     else:
         proxy_mod.init_pool()  # reads PROXY_POOL env var
+
+    if proxy_mod.get_pool().size() > 0:
+        _test_proxy_connectivity(proxy_mod.get_pool())
 
     # Initialise DB schema
     from .db import init_db
