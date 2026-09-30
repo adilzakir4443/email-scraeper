@@ -83,8 +83,12 @@ def main(
 
     --enrich <file.xlsx> runs a completely separate mode: it fills in missing
     columns on an existing spreadsheet instead of running the normal
-    DISCOVER..WRITE pipeline. Example:
+    DISCOVER..WRITE pipeline.
+
+    Enrich an existing Excel sheet:
         email-harvester --enrich my_leads.xlsx --niche "plumbers" --location "Austin, TX"
+    With Google API fallback:
+        email-harvester --enrich my_leads.xlsx --niche "plumbers" --location "Austin, TX" --api-fallback
 
     --api-fallback only ever activates when the proxy-based path has already
     come back empty — never as a routine supplement to it, so API quota is
@@ -118,13 +122,23 @@ def main(
 
     if enrich_path:
         from .enrich import run_enrich
-        run_enrich(
-            input_path=enrich_path,
-            db_path=db_path,
-            niche=niche,
-            location=location,
-            suppress_path=suppress_path,
-        )
+        try:
+            output = run_enrich(
+                input_path=enrich_path,
+                niche=niche,
+                location=location,
+                api_fallback=api_fallback,
+                google_api_key=google_api_key,
+                google_cx=google_cx,
+                google_places_key=google_places_key,
+            )
+        except ValueError as exc:
+            # e.g. the input file has no "Company Name" column — a clear,
+            # one-line message beats a raw traceback for this kind of
+            # ordinary user-input mistake.
+            click.echo(f"\nError: {exc}", err=True)
+            raise SystemExit(1)
+        click.echo(f"\nEnriched file saved to: {output}")
         return  # skip normal pipeline when enriching
 
     logger.info(
