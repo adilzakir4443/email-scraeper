@@ -44,6 +44,8 @@ def _configure_logging(verbose: bool) -> None:
               help="CSV suppression list (columns: type, value)")
 @click.option("--proxy-pool", "proxy_pool", default=None,
               help="Comma-separated proxy URLs (overrides PROXY_POOL env var)")
+@click.option("--enrich",   "enrich_path",  default=None,
+              help="Path to existing Excel file to enrich with missing data")
 @click.option("--stage",    "stage",        default="all",
               type=click.Choice(["all", "discover", "resolve", "crawl", "social", "verify", "write"],
                                 case_sensitive=False),
@@ -59,6 +61,7 @@ def main(
     out_path: Optional[str],
     suppress_path: Optional[str],
     proxy_pool: Optional[str],
+    enrich_path: Optional[str],
     stage: str,
     verbose: bool,
 ) -> None:
@@ -72,6 +75,11 @@ def main(
     Set PROXY_POOL=http://user:pass@host:port,... in the environment (or .env)
     to enable proxy rotation.  Without proxies the tool will run unproxied and
     may be rate-limited by target sites.
+
+    --enrich <file.xlsx> runs a completely separate mode: it fills in missing
+    columns on an existing spreadsheet instead of running the normal
+    DISCOVER..WRITE pipeline. Example:
+        email-harvester --enrich my_leads.xlsx --niche "plumbers" --location "Austin, TX"
     """
     _configure_logging(verbose)
     logger = logging.getLogger(__name__)
@@ -86,6 +94,17 @@ def main(
     # Initialise DB schema
     from .db import init_db
     init_db(db_path)
+
+    if enrich_path:
+        from .enrich import run_enrich
+        run_enrich(
+            input_path=enrich_path,
+            db_path=db_path,
+            niche=niche,
+            location=location,
+            suppress_path=suppress_path,
+        )
+        return  # skip normal pipeline when enriching
 
     logger.info(
         "email-harvester  niche=%r  location=%r  max=%d  db=%s  stage=%s",
