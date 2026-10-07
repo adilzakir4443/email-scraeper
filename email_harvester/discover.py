@@ -24,6 +24,7 @@ from bs4 import BeautifulSoup
 
 from .db import get_conn, upsert_business, count_businesses
 from .proxy import get_pool
+from .browser import BrowserSession, human_delay, human_scroll, safe_goto, parse_proxy_for_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -524,6 +525,312 @@ def _scrape_google_maps(niche: str, location: str, max_results: int) -> Iterator
 
 
 # ---------------------------------------------------------------------------
+# Browser-mode (Playwright) scrapers — used two ways:
+#   - as a fallback retry for a primary httpx-based source that came back
+#     with zero results (--browser), since that's the externally-observable
+#     signal a blocked/403'd request actually produces in this codebase —
+#     every _fetch_with_retry caller already swallows the failure internally
+#     and just yields nothing, rather than raising, so "0 results" is what
+#     "blocked" looks like from run_discover()'s side;
+#   - as standalone browser-only sources (BBB, Manta) that have no httpx
+#     equivalent at all in this file.
+# ---------------------------------------------------------------------------
+
+def _scrape_yellowpages_browser(
+    niche: str, location: str, max_results: int, headless: bool = True, proxy: str | None = None,
+) -> Iterator[dict]:
+    """Browser-rendered retry for Yellow Pages, reusing _parse_yp_listing
+    since the rendered DOM uses the same markup the httpx version parses."""
+    if proxy is None:
+        proxy = get_pool().get()
+
+    query = urllib.parse.quote_plus(niche)
+    geo = urllib.parse.quote_plus(location)
+    url = f"https://www.yellowpages.com/search?search_terms={query}&geo_location_terms={geo}"
+    logger.info("[YP-Browser] Fetching: %s", url)
+
+    seen_names: set[str] = set()
+    collected = 0
+
+    try:
+        with BrowserSession(headless=headless, proxy=parse_proxy_for_playwright(proxy)) as session:
+            page = session.new_page()
+            if not safe_goto(page, url):
+                return
+            human_delay()
+
+            for _ in range(10):  # page-click cap so a stuck "Next" can't loop forever
+                try:
+                    page.wait_for_selector(".result, .organic", timeout=10_000)
+                except Exception:
+                    break
+
+                human_scroll(page)
+                soup = BeautifulSoup(page.content(), "lxml")
+                for card in soup.select(".result, .organic"):
+                    biz = _parse_yp_listing(card)
+                    if not biz or biz["business_name"] in seen_names:
+                        continue
+                    seen_names.add(biz["business_name"])
+                    biz["source"] = "yellowpages"
+                    yield biz
+                    collected += 1
+                    if collected >= max_results:
+                        return
+
+                if collected >= max_results:
+                    return
+
+                next_btn = page.locator('a.next, [aria-label="Next"]').first
+                if next_btn.count() == 0:
+                    break
+                try:
+                    next_btn.click()
+                    human_delay()
+                except Exception:
+                    break
+    except Exception as exc:
+        logger.warning("[YP-Browser] Session error: %s", exc)
+
+
+def _scrape_yelp_browser(
+    niche: str, location: str, max_results: int, headless: bool = True, proxy: str | None = None,
+) -> Iterator[dict]:
+    """Browser-rendered retry for Yelp, reusing _parse_yelp_listing — which
+    deliberately never captures a website_url from the search card (see its
+    docstring: Yelp's card links to Yelp's own listing page, never the real
+    business site, so this doesn't try to extract an "external link" either,
+    despite that otherwise being available on a rendered card)."""
+    if proxy is None:
+        proxy = get_pool().get()
+
+    desc = urllib.parse.quote_plus(niche)
+    loc = urllib.parse.quote_plus(location)
+    url = f"https://www.yelp.com/search?find_desc={desc}&find_loc={loc}"
+    logger.info("[Yelp-Browser] Fetching: %s", url)
+
+    seen_names: set[str] = set()
+    collected = 0
+
+    try:
+        with BrowserSession(headless=headless, proxy=parse_proxy_for_playwright(proxy)) as session:
+            page = session.new_page()
+            if not safe_goto(page, url):
+                return
+            human_delay()
+
+            for _ in range(10):
+                try:
+                    page.wait_for_selector('li[class*="border-color"]', timeout=10_000)
+                except Exception:
+                    break
+
+                human_scroll(page)
+                soup = BeautifulSoup(page.content(), "lxml")
+                cards = soup.select("ul.undefined > li") or soup.select('li[class*="border-color"]')
+                if not cards:
+                    break
+
+                for card in cards:
+                    biz = _parse_yelp_listing(card)
+                    if not biz or biz["business_name"] in seen_names:
+                        continue
+                    seen_names.add(biz["business_name"])
+                    biz["source"] = "yelp"
+                    yield biz
+                    collected += 1
+                    if collected >= max_results:
+                        return
+
+                if collected >= max_results:
+                    return
+
+                next_btn = page.locator('a[aria-label="Next"]').first
+                if next_btn.count() == 0:
+                    break
+                try:
+                    next_btn.click()
+                    human_delay()
+                except Exception:
+                    break
+    except Exception as exc:
+        logger.warning("[Yelp-Browser] Session error: %s", exc)
+
+
+# NOTE: bbb.org sits behind a Cloudflare interstitial ("Just a moment...")
+# that returned the challenge page instead of real results to every attempt
+# made while building this scraper — proxied and unproxied, headless and
+# (in a quick manual check) headed. The selectors below are a best-effort
+# guess at BBB's real markup, following this module's established
+# fallback-chain pattern; they're UNVERIFIED and may need adjustment once
+# run somewhere BBB doesn't challenge (e.g. a residential proxy / real VPS).
+def _parse_bbb_listing(card) -> dict | None:
+    """Parse a single BBB search result card. UNVERIFIED — see note above."""
+    try:
+        name_tag = (
+            card.select_one("h3.result-business-name")
+            or card.select_one("a.text-blue-600")
+            or card.find(["h2", "h3"])
+        )
+        name = name_tag.get_text(strip=True) if name_tag else None
+        if not name:
+            return None
+
+        website_tag = card.select_one("a[href*='bbb.org/'] + a") or card.select_one("a.website-link")
+        website = website_tag.get("href") if website_tag else None
+
+        phone_tag = card.select_one("[class*='phone']") or card.find(string=re.compile(r"\(\d{3}\)"))
+        phone = phone_tag.get_text(strip=True) if hasattr(phone_tag, "get_text") else (
+            str(phone_tag).strip() if phone_tag else None
+        )
+
+        addr_tag = card.select_one("[class*='address']") or card.select_one("address")
+        address = addr_tag.get_text(" ", strip=True) if addr_tag else None
+
+        return {
+            "business_name": name,
+            "website_url": website,
+            "phone": phone,
+            "address": address,
+            "category": None,
+        }
+    except Exception as exc:
+        logger.debug("BBB parse error: %s", exc)
+        return None
+
+
+def _scrape_bbb_browser(
+    niche: str, location: str, max_results: int, headless: bool = True, proxy: str | None = None,
+) -> Iterator[dict]:
+    """Yield business dicts from the Better Business Bureau. UNVERIFIED —
+    see _parse_bbb_listing's note; degrades to zero results rather than
+    raising if BBB's Cloudflare challenge blocks the session."""
+    if proxy is None:
+        proxy = get_pool().get()
+
+    niche_q = urllib.parse.quote_plus(niche)
+    loc_q = urllib.parse.quote_plus(location)
+    url = f"https://www.bbb.org/search?find_text={niche_q}&find_loc={loc_q}"
+    logger.info("[BBB-Browser] Fetching: %s", url)
+
+    seen_names: set[str] = set()
+    collected = 0
+
+    try:
+        with BrowserSession(headless=headless, proxy=parse_proxy_for_playwright(proxy)) as session:
+            page = session.new_page()
+            if not safe_goto(page, url):
+                return
+            human_delay()
+
+            try:
+                page.wait_for_selector('[class*="result"]', timeout=10_000)
+            except Exception:
+                logger.warning("[BBB-Browser] No results rendered — likely blocked")
+                return
+
+            human_scroll(page)
+            soup = BeautifulSoup(page.content(), "lxml")
+            for card in soup.select('[class*="result-card"], [class*="search-result"]'):
+                biz = _parse_bbb_listing(card)
+                if not biz or biz["business_name"] in seen_names:
+                    continue
+                seen_names.add(biz["business_name"])
+                biz["source"] = "bbb"
+                yield biz
+                collected += 1
+                if collected >= max_results:
+                    return
+    except Exception as exc:
+        logger.warning("[BBB-Browser] Session error: %s", exc)
+
+
+# NOTE: manta.com returned a direct 403 to a plain unproxied request while
+# building this scraper. The selectors below are a best-effort guess at
+# Manta's real markup, following this module's established fallback-chain
+# pattern; UNVERIFIED and may need adjustment against real markup.
+def _parse_manta_listing(card) -> dict | None:
+    """Parse a single Manta search result card. UNVERIFIED — see note above."""
+    try:
+        name_tag = (
+            card.select_one("h2.company-name")
+            or card.select_one("a.company-name")
+            or card.find(["h2", "h3"])
+        )
+        name = name_tag.get_text(strip=True) if name_tag else None
+        if not name:
+            return None
+
+        website_tag = card.select_one("a.website") or card.select_one("a[href^='http']:not([href*='manta.com'])")
+        website = website_tag.get("href") if website_tag else None
+
+        phone_tag = card.select_one("[class*='phone']")
+        phone = phone_tag.get_text(strip=True) if phone_tag else None
+
+        addr_tag = card.select_one("[class*='address']") or card.select_one("address")
+        address = addr_tag.get_text(" ", strip=True) if addr_tag else None
+
+        cat_tag = card.select_one("[class*='category']")
+        category = cat_tag.get_text(strip=True) if cat_tag else None
+
+        return {
+            "business_name": name,
+            "website_url": website,
+            "phone": phone,
+            "address": address,
+            "category": category,
+        }
+    except Exception as exc:
+        logger.debug("Manta parse error: %s", exc)
+        return None
+
+
+def _scrape_manta_browser(
+    niche: str, location: str, max_results: int, headless: bool = True, proxy: str | None = None,
+) -> Iterator[dict]:
+    """Yield business dicts from Manta. UNVERIFIED — see _parse_manta_listing's
+    note; degrades to zero results rather than raising if blocked."""
+    if proxy is None:
+        proxy = get_pool().get()
+
+    niche_q = urllib.parse.quote_plus(niche)
+    loc_q = urllib.parse.quote_plus(location)
+    url = f"https://www.manta.com/search?search={niche_q}&location={loc_q}"
+    logger.info("[Manta-Browser] Fetching: %s", url)
+
+    seen_names: set[str] = set()
+    collected = 0
+
+    try:
+        with BrowserSession(headless=headless, proxy=parse_proxy_for_playwright(proxy)) as session:
+            page = session.new_page()
+            if not safe_goto(page, url):
+                return
+            human_delay()
+
+            try:
+                page.wait_for_selector('[class*="company"]', timeout=10_000)
+            except Exception:
+                logger.warning("[Manta-Browser] No results rendered — likely blocked")
+                return
+
+            human_scroll(page)
+            soup = BeautifulSoup(page.content(), "lxml")
+            for card in soup.select('[class*="company-card"], [class*="result"]'):
+                biz = _parse_manta_listing(card)
+                if not biz or biz["business_name"] in seen_names:
+                    continue
+                seen_names.add(biz["business_name"])
+                biz["source"] = "manta"
+                yield biz
+                collected += 1
+                if collected >= max_results:
+                    return
+    except Exception as exc:
+        logger.warning("[Manta-Browser] Session error: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # YellowPages Canada
 #
 # NOTE: yellowpages.ca is behind a CloudFront WAF that returned a blanket
@@ -957,6 +1264,23 @@ _REGION_SOURCES: dict[str, list[str]] = {
 }
 _ALL_SOURCES = ["yellowpages", "bing", "yelp", "yellowpages_ca", "yell_uk", "thomson_local", "google_maps"]
 
+# A primary httpx-based source that comes back with 0 results gets retried
+# through a real browser instead — only these two have a browser-rendered
+# counterpart; the others (Bing, Google Maps, the UK/CA directories) are
+# either already Playwright-based or haven't needed one so far.
+_BROWSER_RETRY_FACTORIES: dict[str, Callable[..., Iterator[dict]]] = {
+    "yellowpages": _scrape_yellowpages_browser,
+    "yelp": _scrape_yelp_browser,
+}
+
+# Browser-only sources with no httpx equivalent at all — only added when
+# --browser is set, and only for US/unrecognized locations (both are
+# US-centric directories).
+_BROWSER_ONLY_SOURCES: dict[str, Callable[..., Iterator[dict]]] = {
+    "bbb": _scrape_bbb_browser,
+    "manta": _scrape_manta_browser,
+}
+
 
 def run_discover(
     db_path: str,
@@ -965,6 +1289,8 @@ def run_discover(
     max_results: int,
     api_fallback: bool = False,
     google_places_key: str | None = None,
+    browser_mode: bool = False,
+    headless: bool = True,
 ) -> None:
     """
     Stage 1: scrape directories and populate the businesses table.
@@ -977,6 +1303,14 @@ def run_discover(
     independent — if one fails outright or returns nothing, that's logged
     and the rest still run; a single bad scraper can't take down the stage.
 
+    If browser_mode is set, a primary source that comes back with 0 results
+    (this codebase's fetch helpers already swallow 403/407/etc. internally
+    and just yield nothing, rather than raising — so "0 results" is the
+    externally-visible shape a block takes) gets retried through a real
+    Playwright session instead of plain httpx, and two browser-only
+    directories with no httpx path at all (BBB, Manta) are added as extra
+    sources for a US/unrecognized location.
+
     If every proxy-based source still comes back with nothing AND
     api_fallback is set AND a Google Places API key is configured, Google
     Places is tried as a last resort. This never runs otherwise — it costs
@@ -984,25 +1318,31 @@ def run_discover(
     failed, not a routine supplement to it.
     """
     region = _detect_region(location)
-    source_names = _REGION_SOURCES.get(region, _ALL_SOURCES)
+    source_names = list(_REGION_SOURCES.get(region, _ALL_SOURCES))
+    if browser_mode and region in ("us", "unknown"):
+        source_names += list(_BROWSER_ONLY_SOURCES.keys())
+
     logger.info(
-        "=== STAGE 1: DISCOVER  niche=%r  location=%r  max=%d  region=%s  sources=%s ===",
-        niche, location, max_results, region, source_names,
+        "=== STAGE 1: DISCOVER  niche=%r  location=%r  max=%d  region=%s  sources=%s  browser_mode=%s ===",
+        niche, location, max_results, region, source_names, browser_mode,
     )
 
     per_source = max(10, max_results // max(1, len(source_names)))
 
     total_inserted = 0
 
-    for i, source_name in enumerate(source_names):
-        factory = _SOURCE_FACTORIES[source_name]
-        budget = max_results if i == 0 else per_source
-
-        logger.info("[DISCOVER] Starting source: %s (budget=%d)", source_name, budget)
-        count = 0
+    def _consume(make_iterator: Callable[[], Iterator[dict]], source_label: str) -> tuple[int, int]:
+        """Call make_iterator() and consume its results, upserting relevant
+        ones. Returns (inserted_count, filtered_count); exceptions are
+        caught and logged, never allowed to take down the rest of the
+        stage — including one raised synchronously by make_iterator()
+        itself, not just one raised partway through iteration, which is
+        why the call happens inside this try rather than at the call site."""
+        nonlocal total_inserted
+        inserted = 0
         filtered = 0
         try:
-            for biz in factory(niche, location, budget):
+            for biz in make_iterator():
                 is_relevant, checked = _is_relevant(
                     biz.get("business_name"), biz.get("category"), niche
                 )
@@ -1023,14 +1363,39 @@ def run_discover(
                         source=biz["source"],
                         relevance_checked=checked,
                     )
-                count += 1
+                inserted += 1
                 total_inserted += 1
         except Exception as exc:
             logger.warning(
                 "[DISCOVER] Source %s failed (%s) — continuing with remaining sources",
-                source_name, exc,
+                source_label, exc,
             )
-            continue
+        return inserted, filtered
+
+    for i, source_name in enumerate(source_names):
+        budget = max_results if i == 0 else per_source
+
+        if source_name in _BROWSER_ONLY_SOURCES:
+            logger.info("[DISCOVER] Starting browser-only source: %s (budget=%d)", source_name, budget)
+            browser_only_factory = _BROWSER_ONLY_SOURCES[source_name]
+            count, filtered = _consume(
+                lambda f=browser_only_factory: f(niche, location, budget, headless=headless),
+                source_name,
+            )
+        else:
+            factory = _SOURCE_FACTORIES[source_name]
+            logger.info("[DISCOVER] Starting source: %s (budget=%d)", source_name, budget)
+            count, filtered = _consume(lambda f=factory: f(niche, location, budget), source_name)
+
+            if count == 0 and browser_mode and source_name in _BROWSER_RETRY_FACTORIES:
+                logger.info("[DISCOVER] Retrying %s with browser mode", source_name)
+                browser_factory = _BROWSER_RETRY_FACTORIES[source_name]
+                browser_count, browser_filtered = _consume(
+                    lambda f=browser_factory: f(niche, location, budget, headless=headless),
+                    f"{source_name} (browser)",
+                )
+                count += browser_count
+                filtered += browser_filtered
 
         if filtered:
             logger.info("[DISCOVER] Filtered %d irrelevant results from %s", filtered, source_name)

@@ -21,6 +21,7 @@ from typing import Optional
 import httpx
 from bs4 import BeautifulSoup
 
+from .browser import BrowserSession, dismiss_cookie_banner, human_delay, human_scroll
 from .db import get_conn, upsert_email, upsert_social
 from .extract import extract_emails
 from .proxy import get_pool
@@ -204,50 +205,54 @@ def _crawl_site_static(base_url: str) -> tuple[list[dict], list[str], dict]:
     return list(all_emails.values()), pages_visited, social
 
 
-def _crawl_site_playwright(base_url: str) -> list[dict]:
+def _crawl_site_playwright(base_url: str) -> tuple[list[dict], dict]:
     """
-    Playwright fallback: render homepage + /contact in headless Chromium.
-    Only called if static crawl yields zero emails.
+    Playwright fallback: render homepage + /contact in a real browser
+    session (via BrowserSession — shared stealth/fingerprint setup with the
+    directory scrapers), for sites whose static HTML comes back empty
+    because their content loads client-side. Only called if the static
+    crawl yields zero emails. Also extracts social links from the rendered
+    pages and returns them alongside the emails: a JS-rendered homepage
+    that hides its emails from the static pass hides its social links from
+    it too, so run_crawl() merges these into whatever the static pass found
+    rather than discarding them.
     """
     try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+        from playwright.sync_api import TimeoutError as PwTimeout
     except ImportError:
         logger.error("Playwright not installed — skipping dynamic fallback for %s", base_url)
-        return []
+        return [], {"facebook": None, "instagram": None, "linkedin": None}
 
     all_emails: dict[str, dict] = {}
+    social: dict[str, str | None] = {"facebook": None, "instagram": None, "linkedin": None}
+
+    def _merge_social(html: str) -> None:
+        for key, value in _extract_social_from_html(html).items():
+            if social[key] is None and value:
+                social[key] = value
 
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
-            context = browser.new_context(
-                user_agent=random.choice(USER_AGENTS),
-                java_script_enabled=True,
-                ignore_https_errors=True,
-            )
-            page = context.new_page()
+        with BrowserSession(headless=True) as session:
+            page = session.new_page()
 
             for path_url in [base_url, base_url.rstrip("/") + "/contact"]:
                 try:
                     page.goto(path_url, timeout=20_000, wait_until="networkidle")
+                    dismiss_cookie_banner(page)
+                    human_scroll(page, times=2)
                     html = page.content()
                     for item in extract_emails(html, path_url):
                         all_emails.setdefault(item["email"], item | {"source_url": path_url})
+                    _merge_social(html)
                 except PwTimeout:
                     logger.debug("[PW] Timeout loading %s", path_url)
                 except Exception as exc:
                     logger.debug("[PW] Error loading %s: %s", path_url, exc)
-                time.sleep(1.0)
-
-            context.close()
-            browser.close()
+                human_delay(800, 1500)
     except Exception as exc:
         logger.error("[PW] Playwright session error for %s: %s", base_url, exc)
 
-    return list(all_emails.values())
+    return list(all_emails.values()), social
 
 
 def run_crawl(db_path: str) -> None:
@@ -295,7 +300,10 @@ def run_crawl(db_path: str) -> None:
         if not emails:
             logger.info("[CRAWL] Zero emails static for %s — trying Playwright", site_url)
             playwright_fallbacks += 1
-            emails = _crawl_site_playwright(site_url)
+            emails, pw_social = _crawl_site_playwright(site_url)
+            for key, value in pw_social.items():
+                if not social.get(key) and value:
+                    social[key] = value
             crawl_status = "done" if emails else "no_emails_static"
         else:
             crawl_status = "done"

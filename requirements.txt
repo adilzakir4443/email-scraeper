@@ -1,3 +1,4 @@
+# After pip install -r requirements.txt, run: playwright install chromium
 httpx[http2]==0.27.0
 brotli==1.2.0
 playwright==1.44.0

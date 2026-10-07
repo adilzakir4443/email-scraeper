@@ -83,6 +83,11 @@ def _configure_logging(verbose: bool) -> None:
 @click.option("--api-fallback", "api_fallback", is_flag=True, default=False,
               help="Use Google API as fallback when proxies fail (needs GOOGLE_API_KEY/"
                    "GOOGLE_PLACES_KEY/GOOGLE_CX in .env — costs real API quota)")
+@click.option("--browser", "browser_mode", is_flag=True, default=False,
+              help="Use a real browser (Playwright) for scraping — slower but bypasses "
+                   "403/407 blocks that plain HTTP requests hit")
+@click.option("--headed", "headed", is_flag=True, default=False,
+              help="Show the browser window (only with --browser, useful for debugging)")
 @click.option("--stage",    "stage",        default="all",
               type=click.Choice(["all", "discover", "resolve", "crawl", "social", "verify", "write"],
                                 case_sensitive=False),
@@ -100,6 +105,8 @@ def main(
     proxy_pool: Optional[str],
     enrich_path: Optional[str],
     api_fallback: bool,
+    browser_mode: bool,
+    headed: bool,
     stage: str,
     verbose: bool,
 ) -> None:
@@ -127,6 +134,24 @@ def main(
     come back empty — never as a routine supplement to it, so API quota is
     never spent while proxies are working. Example:
         email-harvester --niche "plumbers" --location "Austin, TX" --api-fallback
+
+    --browser retries a DISCOVER source through a real Playwright browser
+    (with human-like delays/scrolling) when it comes back empty with plain
+    HTTP, and adds BBB/Manta as extra browser-only sources — slower, but
+    gets past blocks a plain request can't. --headed shows the browser
+    window instead of running headless (only meaningful with --browser).
+
+    # Proxy only (default):
+        email-harvester --niche "plumbers" --location "Austin, TX"
+
+    # Browser mode (bypasses 403/407 blocks):
+        email-harvester --niche "plumbers" --location "Austin, TX" --browser
+
+    # Browser mode visible (watch it work):
+        email-harvester --niche "plumbers" --location "Austin, TX" --browser --headed
+
+    # Browser + API fallback (maximum coverage):
+        email-harvester --niche "plumbers" --location "Austin, TX" --browser --api-fallback
     """
     _configure_logging(verbose)
     logger = logging.getLogger(__name__)
@@ -191,6 +216,7 @@ def main(
         run_discover(
             db_path, niche, location, max_results,
             api_fallback=api_fallback, google_places_key=google_places_key,
+            browser_mode=browser_mode, headless=not headed,
         )
 
     if stage in ("all", "resolve"):
