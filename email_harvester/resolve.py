@@ -116,6 +116,7 @@ def _resolve_one(url: str) -> Optional[str]:
                     final_url = str(resp.url)
                     if attempt_proxy:
                         pool.report_success(attempt_proxy)
+                    logger.debug("[RESOLVE] %s — using %s", url, label)
                     return final_url
             except (httpx.ConnectError, httpx.TimeoutException, httpx.TooManyRedirects) as exc:
                 logger.debug("Resolve attempt %d (%s) failed for %s: %s", attempt, label, url, exc)

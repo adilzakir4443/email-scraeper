@@ -206,7 +206,14 @@ def _extract_social_from_html(html: str) -> dict[str, str | None]:
 
 
 def _extract_from_website(site_url: str) -> dict[str, str | None]:
-    """Fetch a business's homepage + /contact page and look for social links."""
+    """Fetch a business's homepage + /contact page and look for social links.
+
+    Tries a direct (no-proxy) connection first for the homepage — a pool
+    proxy is only spent if direct comes back with nothing at all
+    (connection error, timeout, or any other unresolved failure). Whichever
+    one works is reused for the rest of this site's pages rather than
+    re-deciding per page.
+    """
     pool = get_pool()
     proxy = pool.get()
 
@@ -219,9 +226,37 @@ def _extract_from_website(site_url: str) -> dict[str, str | None]:
     if contact_url not in pages:
         pages.append(contact_url)
 
-    with _make_client(proxy) as client:
-        for page_url in pages:
-            html = _fetch(client, page_url, proxy=proxy)
+    # Homepage: try direct first, fall back to proxy only if direct found nothing.
+    used_proxy: str | None = None
+    homepage_ok = False
+    for attempt_proxy in dict.fromkeys([None, proxy]):
+        try:
+            with _make_client(attempt_proxy) as client:
+                html = _fetch(client, pages[0], proxy=attempt_proxy)
+        except Exception as exc:
+            logger.debug(
+                "[SOCIAL] %s connection failed for %s: %s",
+                "Direct" if attempt_proxy is None else "Proxy", pages[0], exc,
+            )
+            continue
+        if html:
+            used_proxy = attempt_proxy
+            homepage_ok = True
+            found = _extract_social_from_html(html)
+            for key, value in found.items():
+                if result[key] is None and value:
+                    result[key] = value
+            break
+
+    logger.debug("[SOCIAL] %s — using %s", site_url, "proxy" if used_proxy else "direct")
+
+    if not homepage_ok or all(result.values()) or len(pages) == 1:
+        return result
+
+    time.sleep(random.uniform(0.5, 1.5))
+    with _make_client(used_proxy) as client:
+        for page_url in pages[1:]:
+            html = _fetch(client, page_url, proxy=used_proxy)
             if not html:
                 continue
             found = _extract_social_from_html(html)
@@ -263,8 +298,26 @@ def _bing_search_social(
     query = urllib.parse.quote_plus(f"{business_name} {location} site:{domain}")
     url = f"https://www.bing.com/search?q={query}"
 
-    with _make_client(proxy) as client:
-        html = _fetch(client, url, proxy=proxy)
+    # Try direct first, fall back to the pool's proxy only if direct comes
+    # back with nothing — never spent once direct already worked.
+    html: str | None = None
+    used_proxy: str | None = None
+    for attempt_proxy in dict.fromkeys([None, proxy]):
+        try:
+            with _make_client(attempt_proxy) as client:
+                attempt_html = _fetch(client, url, proxy=attempt_proxy)
+        except Exception as exc:
+            logger.debug(
+                "[SOCIAL] %s connection failed for %s: %s",
+                "Direct" if attempt_proxy is None else "Proxy", url, exc,
+            )
+            continue
+        if attempt_html:
+            html = attempt_html
+            used_proxy = attempt_proxy
+            break
+
+    logger.debug("[SOCIAL] %s — using %s", url, "proxy" if used_proxy else "direct")
 
     if html:
         soup = BeautifulSoup(html, "lxml")

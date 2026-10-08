@@ -191,6 +191,8 @@ def _crawl_site_static(base_url: str) -> tuple[list[dict], list[str], dict]:
     if html is None:
         return [], [], social
 
+    logger.debug("[CRAWL] %s — using %s", base_url, "proxy" if used_proxy else "direct")
+
     pages_visited.append(base_url)
     for item in extract_emails(html, base_url):
         all_emails.setdefault(item["email"], item | {"source_url": base_url})
