@@ -21,7 +21,7 @@ from typing import Optional
 import httpx
 from bs4 import BeautifulSoup
 
-from .browser import BrowserSession, dismiss_cookie_banner, human_delay, human_scroll
+from .browser import BrowserSession, dismiss_cookie_banner, human_delay, human_scroll, run_in_thread
 from .db import get_conn, upsert_email, upsert_social
 from .extract import extract_emails
 from .proxy import get_pool
@@ -216,6 +216,11 @@ def _crawl_site_playwright(base_url: str) -> tuple[list[dict], dict]:
     that hides its emails from the static pass hides its social links from
     it too, so run_crawl() merges these into whatever the static pass found
     rather than discarding them.
+
+    The whole session runs inside run_in_thread() — see its docstring in
+    browser.py: the sync Playwright API raises if the calling thread
+    already has a running asyncio event loop, which this sidesteps by
+    always running in a fresh worker thread instead.
     """
     try:
         from playwright.sync_api import TimeoutError as PwTimeout
@@ -223,15 +228,15 @@ def _crawl_site_playwright(base_url: str) -> tuple[list[dict], dict]:
         logger.error("Playwright not installed — skipping dynamic fallback for %s", base_url)
         return [], {"facebook": None, "instagram": None, "linkedin": None}
 
-    all_emails: dict[str, dict] = {}
-    social: dict[str, str | None] = {"facebook": None, "instagram": None, "linkedin": None}
+    def _do_scrape() -> tuple[list[dict], dict]:
+        all_emails: dict[str, dict] = {}
+        social: dict[str, str | None] = {"facebook": None, "instagram": None, "linkedin": None}
 
-    def _merge_social(html: str) -> None:
-        for key, value in _extract_social_from_html(html).items():
-            if social[key] is None and value:
-                social[key] = value
+        def _merge_social(html: str) -> None:
+            for key, value in _extract_social_from_html(html).items():
+                if social[key] is None and value:
+                    social[key] = value
 
-    try:
         with BrowserSession(headless=True) as session:
             page = session.new_page()
 
@@ -249,10 +254,14 @@ def _crawl_site_playwright(base_url: str) -> tuple[list[dict], dict]:
                 except Exception as exc:
                     logger.debug("[PW] Error loading %s: %s", path_url, exc)
                 human_delay(800, 1500)
+
+        return list(all_emails.values()), social
+
+    try:
+        return run_in_thread(_do_scrape)
     except Exception as exc:
         logger.error("[PW] Playwright session error for %s: %s", base_url, exc)
-
-    return list(all_emails.values()), social
+        return [], {"facebook": None, "instagram": None, "linkedin": None}
 
 
 def run_crawl(db_path: str) -> None:

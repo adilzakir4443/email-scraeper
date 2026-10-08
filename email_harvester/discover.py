@@ -24,7 +24,9 @@ from bs4 import BeautifulSoup
 
 from .db import get_conn, upsert_business, count_businesses
 from .proxy import get_pool
-from .browser import BrowserSession, human_delay, human_scroll, safe_goto, parse_proxy_for_playwright
+from .browser import (
+    BrowserSession, human_delay, human_scroll, run_in_thread, safe_goto, parse_proxy_for_playwright,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -460,6 +462,15 @@ def _scrape_google_maps(niche: str, location: str, max_results: int) -> Iterator
     live: the raw HTTP response contains none of the listing markup), so
     this uses headless Chromium via Playwright rather than a plain GET, and
     scrolls the results feed to load more than the initial page of cards.
+
+    The whole Playwright session runs inside run_in_thread(): Playwright's
+    sync API raises if the calling thread already has a running asyncio
+    event loop (confirmed live — see browser.run_in_thread's docstring),
+    which some Click/CLI invocations do. Since that means this can no
+    longer yield progressively while scrolling, results are collected into
+    a list inside the thread and handed back as a batch once the thread
+    returns — every caller already just iterates this to completion
+    regardless, so that's not a behavior change that matters.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -471,10 +482,10 @@ def _scrape_google_maps(niche: str, location: str, max_results: int) -> Iterator
     url = f"https://www.google.com/maps/search/{query}"
     logger.info("[GoogleMaps] Fetching: %s", url)
 
-    seen_names: set[str] = set()
-    collected = 0
+    def _do_scrape() -> list[dict]:
+        results: list[dict] = []
+        seen_names: set[str] = set()
 
-    try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(
                 headless=True,
@@ -500,10 +511,9 @@ def _scrape_google_maps(niche: str, location: str, max_results: int) -> Iterator
                             continue
                         seen_names.add(biz["business_name"])
                         biz["source"] = "google_maps"
-                        yield biz
-                        collected += 1
-                        if collected >= max_results:
-                            return
+                        results.append(biz)
+                        if len(results) >= max_results:
+                            return results
 
                     try:
                         feed.evaluate("el => el.scrollTop = el.scrollHeight")
@@ -520,8 +530,16 @@ def _scrape_google_maps(niche: str, location: str, max_results: int) -> Iterator
                         stagnant_scrolls = 0
             finally:
                 browser.close()
+
+        return results
+
+    try:
+        results = run_in_thread(_do_scrape)
     except Exception as exc:
         logger.warning("[GoogleMaps] Session error: %s", exc)
+        return
+
+    yield from results
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +558,15 @@ def _scrape_yellowpages_browser(
     niche: str, location: str, max_results: int, headless: bool = True, proxy: str | None = None,
 ) -> Iterator[dict]:
     """Browser-rendered retry for Yellow Pages, reusing _parse_yp_listing
-    since the rendered DOM uses the same markup the httpx version parses."""
+    since the rendered DOM uses the same markup the httpx version parses.
+
+    The whole session runs inside run_in_thread() — see its docstring: the
+    sync Playwright API raises if the calling thread already has a running
+    asyncio event loop, which this sidesteps by always running in a fresh
+    worker thread instead. That also means results are collected into a
+    list inside the thread rather than yielded progressively while
+    scrolling — every caller already just iterates this to completion
+    regardless, so that's not a behavior change that matters."""
     if proxy is None:
         proxy = get_pool().get()
 
@@ -549,14 +575,14 @@ def _scrape_yellowpages_browser(
     url = f"https://www.yellowpages.com/search?search_terms={query}&geo_location_terms={geo}"
     logger.info("[YP-Browser] Fetching: %s", url)
 
-    seen_names: set[str] = set()
-    collected = 0
+    def _do_scrape() -> list[dict]:
+        results: list[dict] = []
+        seen_names: set[str] = set()
 
-    try:
         with BrowserSession(headless=headless, proxy=parse_proxy_for_playwright(proxy)) as session:
             page = session.new_page()
             if not safe_goto(page, url):
-                return
+                return results
             human_delay()
 
             for _ in range(10):  # page-click cap so a stuck "Next" can't loop forever
@@ -573,13 +599,9 @@ def _scrape_yellowpages_browser(
                         continue
                     seen_names.add(biz["business_name"])
                     biz["source"] = "yellowpages"
-                    yield biz
-                    collected += 1
-                    if collected >= max_results:
-                        return
-
-                if collected >= max_results:
-                    return
+                    results.append(biz)
+                    if len(results) >= max_results:
+                        return results
 
                 next_btn = page.locator('a.next, [aria-label="Next"]').first
                 if next_btn.count() == 0:
@@ -589,8 +611,16 @@ def _scrape_yellowpages_browser(
                     human_delay()
                 except Exception:
                     break
+
+        return results
+
+    try:
+        results = run_in_thread(_do_scrape)
     except Exception as exc:
         logger.warning("[YP-Browser] Session error: %s", exc)
+        return
+
+    yield from results
 
 
 def _scrape_yelp_browser(
@@ -600,7 +630,11 @@ def _scrape_yelp_browser(
     deliberately never captures a website_url from the search card (see its
     docstring: Yelp's card links to Yelp's own listing page, never the real
     business site, so this doesn't try to extract an "external link" either,
-    despite that otherwise being available on a rendered card)."""
+    despite that otherwise being available on a rendered card).
+
+    Runs inside run_in_thread() — see _scrape_yellowpages_browser's
+    docstring for why, and why results are collected rather than yielded
+    progressively."""
     if proxy is None:
         proxy = get_pool().get()
 
@@ -609,14 +643,14 @@ def _scrape_yelp_browser(
     url = f"https://www.yelp.com/search?find_desc={desc}&find_loc={loc}"
     logger.info("[Yelp-Browser] Fetching: %s", url)
 
-    seen_names: set[str] = set()
-    collected = 0
+    def _do_scrape() -> list[dict]:
+        results: list[dict] = []
+        seen_names: set[str] = set()
 
-    try:
         with BrowserSession(headless=headless, proxy=parse_proxy_for_playwright(proxy)) as session:
             page = session.new_page()
             if not safe_goto(page, url):
-                return
+                return results
             human_delay()
 
             for _ in range(10):
@@ -637,13 +671,9 @@ def _scrape_yelp_browser(
                         continue
                     seen_names.add(biz["business_name"])
                     biz["source"] = "yelp"
-                    yield biz
-                    collected += 1
-                    if collected >= max_results:
-                        return
-
-                if collected >= max_results:
-                    return
+                    results.append(biz)
+                    if len(results) >= max_results:
+                        return results
 
                 next_btn = page.locator('a[aria-label="Next"]').first
                 if next_btn.count() == 0:
@@ -653,8 +683,16 @@ def _scrape_yelp_browser(
                     human_delay()
                 except Exception:
                     break
+
+        return results
+
+    try:
+        results = run_in_thread(_do_scrape)
     except Exception as exc:
         logger.warning("[Yelp-Browser] Session error: %s", exc)
+        return
+
+    yield from results
 
 
 # NOTE: bbb.org sits behind a Cloudflare interstitial ("Just a moment...")
@@ -704,7 +742,11 @@ def _scrape_bbb_browser(
 ) -> Iterator[dict]:
     """Yield business dicts from the Better Business Bureau. UNVERIFIED —
     see _parse_bbb_listing's note; degrades to zero results rather than
-    raising if BBB's Cloudflare challenge blocks the session."""
+    raising if BBB's Cloudflare challenge blocks the session.
+
+    Runs inside run_in_thread() — see _scrape_yellowpages_browser's
+    docstring for why, and why results are collected rather than yielded
+    progressively."""
     if proxy is None:
         proxy = get_pool().get()
 
@@ -713,21 +755,21 @@ def _scrape_bbb_browser(
     url = f"https://www.bbb.org/search?find_text={niche_q}&find_loc={loc_q}"
     logger.info("[BBB-Browser] Fetching: %s", url)
 
-    seen_names: set[str] = set()
-    collected = 0
+    def _do_scrape() -> list[dict]:
+        results: list[dict] = []
+        seen_names: set[str] = set()
 
-    try:
         with BrowserSession(headless=headless, proxy=parse_proxy_for_playwright(proxy)) as session:
             page = session.new_page()
             if not safe_goto(page, url):
-                return
+                return results
             human_delay()
 
             try:
                 page.wait_for_selector('[class*="result"]', timeout=10_000)
             except Exception:
                 logger.warning("[BBB-Browser] No results rendered — likely blocked")
-                return
+                return results
 
             human_scroll(page)
             soup = BeautifulSoup(page.content(), "lxml")
@@ -737,12 +779,19 @@ def _scrape_bbb_browser(
                     continue
                 seen_names.add(biz["business_name"])
                 biz["source"] = "bbb"
-                yield biz
-                collected += 1
-                if collected >= max_results:
-                    return
+                results.append(biz)
+                if len(results) >= max_results:
+                    return results
+
+        return results
+
+    try:
+        results = run_in_thread(_do_scrape)
     except Exception as exc:
         logger.warning("[BBB-Browser] Session error: %s", exc)
+        return
+
+    yield from results
 
 
 # NOTE: manta.com returned a direct 403 to a plain unproxied request while
@@ -789,7 +838,11 @@ def _scrape_manta_browser(
     niche: str, location: str, max_results: int, headless: bool = True, proxy: str | None = None,
 ) -> Iterator[dict]:
     """Yield business dicts from Manta. UNVERIFIED — see _parse_manta_listing's
-    note; degrades to zero results rather than raising if blocked."""
+    note; degrades to zero results rather than raising if blocked.
+
+    Runs inside run_in_thread() — see _scrape_yellowpages_browser's
+    docstring for why, and why results are collected rather than yielded
+    progressively."""
     if proxy is None:
         proxy = get_pool().get()
 
@@ -798,21 +851,21 @@ def _scrape_manta_browser(
     url = f"https://www.manta.com/search?search={niche_q}&location={loc_q}"
     logger.info("[Manta-Browser] Fetching: %s", url)
 
-    seen_names: set[str] = set()
-    collected = 0
+    def _do_scrape() -> list[dict]:
+        results: list[dict] = []
+        seen_names: set[str] = set()
 
-    try:
         with BrowserSession(headless=headless, proxy=parse_proxy_for_playwright(proxy)) as session:
             page = session.new_page()
             if not safe_goto(page, url):
-                return
+                return results
             human_delay()
 
             try:
                 page.wait_for_selector('[class*="company"]', timeout=10_000)
             except Exception:
                 logger.warning("[Manta-Browser] No results rendered — likely blocked")
-                return
+                return results
 
             human_scroll(page)
             soup = BeautifulSoup(page.content(), "lxml")
@@ -822,12 +875,19 @@ def _scrape_manta_browser(
                     continue
                 seen_names.add(biz["business_name"])
                 biz["source"] = "manta"
-                yield biz
-                collected += 1
-                if collected >= max_results:
-                    return
+                results.append(biz)
+                if len(results) >= max_results:
+                    return results
+
+        return results
+
+    try:
+        results = run_in_thread(_do_scrape)
     except Exception as exc:
         logger.warning("[Manta-Browser] Session error: %s", exc)
+        return
+
+    yield from results
 
 
 # ---------------------------------------------------------------------------

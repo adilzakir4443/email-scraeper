@@ -10,12 +10,19 @@ Headless by default; pass headless=False (wired to --headed on the CLI) to
 watch a session work, e.g. while debugging a selector that stopped matching.
 """
 
+import concurrent.futures
 import logging
 import random
 import time
 import urllib.parse
 
 logger = logging.getLogger(__name__)
+
+# How long a single browser-mode scrape is allowed to run in its worker
+# thread before giving up — generous, since a slow proxy + multiple page
+# loads + human-paced delays can legitimately take a while, but still finite
+# so a hung browser can't block the whole DISCOVER/CRAWL stage forever.
+_THREAD_TIMEOUT = 120
 
 DEFAULT_VIEWPORT = {"width": 1366, "height": 768}
 
@@ -193,3 +200,25 @@ def parse_proxy_for_playwright(proxy_url: str | None) -> dict | None:
         return result
     except Exception:
         return None
+
+
+def run_in_thread(fn, *args, **kwargs):
+    """
+    Run a sync-Playwright function in a fresh worker thread.
+
+    Playwright's sync API refuses to start if the calling thread already
+    has a running asyncio event loop ("It looks like you are using
+    Playwright Sync API inside the asyncio loop") — confirmed live: calling
+    BrowserSession directly from inside `asyncio.run(...)` raises exactly
+    that error, and running the same call through this helper instead does
+    not. A fresh thread has no event loop of its own, so Playwright's
+    own internal loop (which it also runs in a dedicated thread) never
+    collides with one the caller happens to be running.
+
+    Every BrowserSession usage must be fully self-contained inside fn —
+    created, used and torn down in the one thread fn runs in — since
+    Playwright's sync objects aren't safe to hand across threads.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(fn, *args, **kwargs)
+        return future.result(timeout=_THREAD_TIMEOUT)
