@@ -77,46 +77,54 @@ def _resolve_one(url: str) -> Optional[str]:
     """
     Follow at most one redirect and return the final URL.
     Returns None on network/DNS failure.
+
+    Tries a direct (no-proxy) connection first; only falls back to a pool
+    proxy if every direct attempt hits a connection error or timeout (or
+    some other unresolved error) without ever getting a usable response.
+    Never spends a proxy once direct already worked.
     """
     pool = get_pool()
     proxy = pool.get()
-    proxies = {"http://": proxy, "https://": proxy} if proxy else None
-    auth_header = pool.get_auth_header(proxy)
 
-    for attempt in range(3):
-        try:
-            with httpx.Client(
-                proxies=proxies,
-                follow_redirects=True,
-                max_redirects=5,
-                timeout=httpx.Timeout(15.0),
-                verify=True,
-                headers=auth_header or None,
-            ) as client:
-                resp = client.head(url, headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; EmailHarvester/1.0)",
-                })
-                # HEAD sometimes returns 405; fall back to GET
-                if resp.status_code == 405:
-                    resp = client.get(url, headers={
+    for attempt_proxy in dict.fromkeys([None, proxy]):
+        proxies = {"http://": attempt_proxy, "https://": attempt_proxy} if attempt_proxy else None
+        auth_header = pool.get_auth_header(attempt_proxy)
+        label = "direct" if attempt_proxy is None else "proxy"
+
+        for attempt in range(3):
+            try:
+                with httpx.Client(
+                    proxies=proxies,
+                    follow_redirects=True,
+                    max_redirects=5,
+                    timeout=httpx.Timeout(15.0),
+                    verify=True,
+                    headers=auth_header or None,
+                ) as client:
+                    resp = client.head(url, headers={
                         "User-Agent": "Mozilla/5.0 (compatible; EmailHarvester/1.0)",
                     })
-                if resp.status_code == 407:
-                    pool.mark_407(proxy)
-                    logger.warning("407 Proxy Auth failed for %s — check proxy credentials", url)
-                    break  # don't retry 407 — it won't fix itself with the same proxy
-                final_url = str(resp.url)
-                if proxy:
-                    pool.report_success(proxy)
-                return final_url
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.TooManyRedirects) as exc:
-            logger.debug("Resolve attempt %d failed for %s: %s", attempt, url, exc)
-            if proxy:
-                pool.report_failure(proxy)
-            pool.backoff_sleep(attempt + 1)
-        except Exception as exc:
-            logger.warning("Unexpected error resolving %s: %s", url, exc)
-            break
+                    # HEAD sometimes returns 405; fall back to GET
+                    if resp.status_code == 405:
+                        resp = client.get(url, headers={
+                            "User-Agent": "Mozilla/5.0 (compatible; EmailHarvester/1.0)",
+                        })
+                    if resp.status_code == 407:
+                        pool.mark_407(attempt_proxy)
+                        logger.warning("407 Proxy Auth failed for %s — check proxy credentials", url)
+                        break  # don't retry 407 with the same proxy — try the next candidate
+                    final_url = str(resp.url)
+                    if attempt_proxy:
+                        pool.report_success(attempt_proxy)
+                    return final_url
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.TooManyRedirects) as exc:
+                logger.debug("Resolve attempt %d (%s) failed for %s: %s", attempt, label, url, exc)
+                if attempt_proxy:
+                    pool.report_failure(attempt_proxy)
+                pool.backoff_sleep(attempt + 1)
+            except Exception as exc:
+                logger.warning("Unexpected error resolving %s (%s): %s", url, label, exc)
+                break  # stop retrying this candidate; fall through to the next one
 
     return None
 

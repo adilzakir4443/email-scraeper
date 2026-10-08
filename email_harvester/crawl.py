@@ -148,6 +148,13 @@ def _crawl_site_static(base_url: str) -> tuple[list[dict], list[str], dict]:
     Returns (emails_list, pages_visited, social_links).
     social_links is {"facebook": url|None, "instagram": url|None, "linkedin": url|None},
     merged across every page visited (first match per platform wins).
+
+    Tries a direct (no-proxy) connection first — a proxy from the pool is
+    only spent if the direct attempt comes back with nothing at all
+    (connection error, timeout, or any other failure _fetch_page couldn't
+    resolve on its own retries). Once the homepage decides which one
+    actually works, the rest of that site's pages reuse the same choice
+    rather than re-deciding per page.
     """
     pool = get_pool()
     proxy = pool.get()
@@ -161,40 +168,59 @@ def _crawl_site_static(base_url: str) -> tuple[list[dict], list[str], dict]:
             if social[key] is None and value:
                 social[key] = value
 
-    with _make_client(proxy) as client:
-        # Homepage first
-        html = _fetch_page(client, base_url, proxy=proxy)
-        if html is None:
-            return [], [], social
+    # Homepage: try direct first, fall back to proxy only if direct found
+    # nothing. dict.fromkeys dedupes the no-proxies-configured case
+    # (proxy is already None) so direct isn't attempted twice.
+    html: Optional[str] = None
+    used_proxy: str | None = None
+    for attempt_proxy in dict.fromkeys([None, proxy]):
+        try:
+            with _make_client(attempt_proxy) as client:
+                attempt_html = _fetch_page(client, base_url, proxy=attempt_proxy)
+        except Exception as exc:
+            logger.debug(
+                "[CRAWL] %s connection failed for %s: %s",
+                "Direct" if attempt_proxy is None else "Proxy", base_url, exc,
+            )
+            continue
+        if attempt_html:
+            html = attempt_html
+            used_proxy = attempt_proxy
+            break
 
-        pages_visited.append(base_url)
-        for item in extract_emails(html, base_url):
-            all_emails.setdefault(item["email"], item | {"source_url": base_url})
-        _merge_social(html)
+    if html is None:
+        return [], [], social
 
-        # Discover contact/about links from homepage
-        discovered = _discover_contact_links(html, base_url)
+    pages_visited.append(base_url)
+    for item in extract_emails(html, base_url):
+        all_emails.setdefault(item["email"], item | {"source_url": base_url})
+    _merge_social(html)
 
-        # Build full list: default paths + discovered, deduped
-        domain = _base_domain(base_url)
-        to_visit: list[str] = []
-        seen_paths: set[str] = {base_url}
+    # Discover contact/about links from homepage
+    discovered = _discover_contact_links(html, base_url)
 
-        for path in _DEFAULT_PATHS:
-            url = domain + path
-            if url not in seen_paths:
-                to_visit.append(url)
-                seen_paths.add(url)
+    # Build full list: default paths + discovered, deduped
+    domain = _base_domain(base_url)
+    to_visit: list[str] = []
+    seen_paths: set[str] = {base_url}
 
-        for url in discovered:
-            if url not in seen_paths:
-                to_visit.append(url)
-                seen_paths.add(url)
+    for path in _DEFAULT_PATHS:
+        url = domain + path
+        if url not in seen_paths:
+            to_visit.append(url)
+            seen_paths.add(url)
 
-        # Visit each sub-page
+    for url in discovered:
+        if url not in seen_paths:
+            to_visit.append(url)
+            seen_paths.add(url)
+
+    # Visit each sub-page, reusing whichever connection (direct or proxy)
+    # the homepage fetch already proved works for this site.
+    with _make_client(used_proxy) as client:
         for page_url in to_visit[:MAX_PAGES_PER_SITE]:
             time.sleep(random.uniform(0.5, 1.5))  # intra-site politeness
-            sub_html = _fetch_page(client, page_url, proxy=proxy)
+            sub_html = _fetch_page(client, page_url, proxy=used_proxy)
             if sub_html is None:
                 continue
             pages_visited.append(page_url)
