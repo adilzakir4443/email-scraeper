@@ -23,6 +23,7 @@ from typing import Optional
 
 import httpx
 import openpyxl
+from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import PatternFill
 from bs4 import BeautifulSoup
 
@@ -187,7 +188,7 @@ def _bing_search(query: str, proxy: Optional[str]) -> list[dict]:
     url = f"https://www.bing.com/search?q={urllib.parse.quote_plus(query)}"
     try:
         with _make_client(proxy) as client:
-            html = _fetch(client, url)
+            html = _fetch(client, url, proxy=proxy)
     except Exception as exc:
         logger.debug("[ENRICH] Bing search failed for %r: %s", query, exc)
         return []
@@ -536,6 +537,18 @@ def run_enrich(
             if col_idx is None or col_idx >= len(row_cells):
                 return
             cell = row_cells[col_idx]
+            if isinstance(cell, MergedCell):
+                # MergedCell.value is read-only in openpyxl (AttributeError
+                # on assignment) — only the merge's top-left anchor cell is
+                # writable, which lives in a different column than the one
+                # this field maps to, so there's no safe cell to write this
+                # value into. Skip rather than crash the whole run over one
+                # row's leftover formatting.
+                logger.warning(
+                    "[ENRICH] Skipping %s for %s — cell is part of a merged range",
+                    field, name,
+                )
+                return
             cell.value = value
             cell.fill = ENRICHED_FILL
             row_changed = True
