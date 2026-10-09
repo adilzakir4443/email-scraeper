@@ -552,21 +552,110 @@ def _scrape_google_maps(niche: str, location: str, max_results: int) -> Iterator
 #     "blocked" looks like from run_discover()'s side;
 #   - as standalone browser-only sources (BBB, Manta) that have no httpx
 #     equivalent at all in this file.
+#
+# Field extraction here works directly against Playwright ElementHandles
+# (query_selector/inner_text) rather than a BeautifulSoup snapshot, via
+# _try_selectors/_try_selector_attr below — each field gets a list of
+# fallback CSS selectors tried in order, since a site's markup commonly
+# has more than one variant in the wild (A/B tests, listing types, etc.)
+# and a single hardcoded selector silently matching nothing was exactly
+# the bug this was written to fix.
 # ---------------------------------------------------------------------------
+
+_PHONE_LIKE_RE = re.compile(r"\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}")
+
+
+def _try_selectors(element, selectors: list[str]) -> str:
+    """Try multiple CSS selectors against a Playwright element, return the
+    first non-empty inner_text() found."""
+    for selector in selectors:
+        try:
+            el = element.query_selector(selector)
+            if el:
+                text = el.inner_text().strip()
+                if text:
+                    return text
+        except Exception:
+            continue
+    return ""
+
+
+def _try_selector_attr(element, selectors: list[str], attr: str) -> str:
+    """Like _try_selectors, but returns an attribute value (e.g. href)
+    instead of text — needed for website links, which _try_selectors
+    alone can't get at."""
+    for selector in selectors:
+        try:
+            el = element.query_selector(selector)
+            if el:
+                value = el.get_attribute(attr)
+                if value:
+                    return value.strip()
+        except Exception:
+            continue
+    return ""
+
+
+def _find_phone_like_text(element, selector: str) -> str:
+    """Scan every element matching selector for one whose text looks like
+    a phone number — used where a site has no dedicated phone class/
+    attribute to select directly, only a generic container that also
+    holds other text."""
+    try:
+        for el in element.query_selector_all(selector):
+            text = el.inner_text().strip()
+            if _PHONE_LIKE_RE.search(text):
+                return text
+    except Exception:
+        pass
+    return ""
+
+
+def _take_debug_screenshot(page, path: str, source_label: str) -> None:
+    """Best-effort screenshot for diagnosing a zero-result scrape — e.g. to
+    tell a changed selector apart from a bot-block page from the next run.
+    Never raises: a failed screenshot (missing directory, closed page,
+    etc.) is a secondary problem, not worth losing the real result over."""
+    try:
+        page.screenshot(path=path)
+        logger.warning("[%s] Zero results — saved debug screenshot to %s", source_label, path)
+    except Exception as exc:
+        logger.debug("[%s] Screenshot failed: %s", source_label, exc)
+
+
+_YP_CARD_SELECTOR = "div.result, div.v-card"
+_YP_NAME_SELECTORS = ["a.business-name > span", "h2.n > a"]
+_YP_PHONE_SELECTORS = ["div.phones.phone.primary", "p.phone"]
+_YP_STREET_SELECTORS = ["span.street-address"]
+_YP_LOCALITY_SELECTORS = ["span.locality"]
+_YP_CATEGORY_SELECTORS = ["div.categories > a", "p.body > a"]
+_YP_WEBSITE_SELECTORS = ["a.track-visit-website", "a[data-analytics='website']"]
+
 
 def _scrape_yellowpages_browser(
     niche: str, location: str, max_results: int, headless: bool = True, proxy: str | None = None,
 ) -> Iterator[dict]:
-    """Browser-rendered retry for Yellow Pages, reusing _parse_yp_listing
-    since the rendered DOM uses the same markup the httpx version parses.
+    """Browser-rendered retry for Yellow Pages, extracting fields directly
+    from the rendered DOM (not a bs4 snapshot) via _try_selectors, with
+    several fallback selectors per field.
 
-    The whole session runs inside run_in_thread() — see its docstring: the
-    sync Playwright API raises if the calling thread already has a running
-    asyncio event loop, which this sidesteps by always running in a fresh
-    worker thread instead. That also means results are collected into a
-    list inside the thread rather than yielded progressively while
-    scrolling — every caller already just iterates this to completion
-    regardless, so that's not a behavior change that matters."""
+    UNVERIFIED against real result markup: every attempt made while
+    building this fix — proxied and unproxied — hit a Cloudflare
+    "Attention Required!" interstitial instead of real search results
+    (confirmed live), the same sandbox-wide block already documented for
+    bbb.org/manta.com/yell.com elsewhere in this file. The selectors below
+    follow the exact structure given in the task spec; on 0 results this
+    now saves a debug screenshot to /tmp/yp_debug.png (POSIX path — only
+    meaningful on a real Linux VPS, not this Windows dev sandbox) so that
+    can be checked directly instead of guessing blind.
+
+    Runs inside run_in_thread() — see its docstring: the sync Playwright
+    API raises if the calling thread already has a running asyncio event
+    loop, which this sidesteps by always running in a fresh worker thread
+    instead. That also means results are collected into a list inside the
+    thread rather than yielded progressively while scrolling — every
+    caller already just iterates this to completion regardless, so that's
+    not a behavior change that matters."""
     if proxy is None:
         proxy = get_pool().get()
 
@@ -587,30 +676,52 @@ def _scrape_yellowpages_browser(
 
             for _ in range(10):  # page-click cap so a stuck "Next" can't loop forever
                 try:
-                    page.wait_for_selector(".result, .organic", timeout=10_000)
+                    page.wait_for_selector(_YP_CARD_SELECTOR, timeout=15_000)
                 except Exception:
+                    logger.warning("[YP-Browser] Selector timed out — no results page detected")
                     break
 
                 human_scroll(page)
-                soup = BeautifulSoup(page.content(), "lxml")
-                for card in soup.select(".result, .organic"):
-                    biz = _parse_yp_listing(card)
-                    if not biz or biz["business_name"] in seen_names:
+                cards = page.query_selector_all(_YP_CARD_SELECTOR)
+                logger.info("[YP-Browser] Found %d result cards", len(cards))
+
+                for card in cards:
+                    name = _try_selectors(card, _YP_NAME_SELECTORS)
+                    if not name or name in seen_names:
                         continue
-                    seen_names.add(biz["business_name"])
-                    biz["source"] = "yellowpages"
+                    seen_names.add(name)
+
+                    street = _try_selectors(card, _YP_STREET_SELECTORS)
+                    locality = _try_selectors(card, _YP_LOCALITY_SELECTORS)
+                    address = ", ".join(p for p in (street, locality) if p) or None
+
+                    biz = {
+                        "business_name": name,
+                        "website_url": _try_selector_attr(card, _YP_WEBSITE_SELECTORS, "href") or None,
+                        "phone": _try_selectors(card, _YP_PHONE_SELECTORS) or None,
+                        "address": address,
+                        "category": _try_selectors(card, _YP_CATEGORY_SELECTORS) or None,
+                        "source": "yellowpages",
+                    }
+                    logger.debug("[YP-Browser] Extracted: %s", biz)
                     results.append(biz)
                     if len(results) >= max_results:
-                        return results
+                        break
 
-                next_btn = page.locator('a.next, [aria-label="Next"]').first
-                if next_btn.count() == 0:
+                if len(results) >= max_results:
+                    break
+
+                next_btn = page.query_selector("a.next.ajax-page")
+                if next_btn is None:
                     break
                 try:
                     next_btn.click()
                     human_delay()
                 except Exception:
                     break
+
+            if len(results) == 0:
+                _take_debug_screenshot(page, "/tmp/yp_debug.png", "YP-Browser")
 
         return results
 
@@ -695,54 +806,52 @@ def _scrape_yelp_browser(
     yield from results
 
 
-# NOTE: bbb.org sits behind a Cloudflare interstitial ("Just a moment...")
-# that returned the challenge page instead of real results to every attempt
-# made while building this scraper — proxied and unproxied, headless and
-# (in a quick manual check) headed. The selectors below are a best-effort
-# guess at BBB's real markup, following this module's established
-# fallback-chain pattern; they're UNVERIFIED and may need adjustment once
-# run somewhere BBB doesn't challenge (e.g. a residential proxy / real VPS).
-def _parse_bbb_listing(card) -> dict | None:
-    """Parse a single BBB search result card. UNVERIFIED — see note above."""
-    try:
-        name_tag = (
-            card.select_one("h3.result-business-name")
-            or card.select_one("a.text-blue-600")
-            or card.find(["h2", "h3"])
-        )
-        name = name_tag.get_text(strip=True) if name_tag else None
-        if not name:
-            return None
-
-        website_tag = card.select_one("a[href*='bbb.org/'] + a") or card.select_one("a.website-link")
-        website = website_tag.get("href") if website_tag else None
-
-        phone_tag = card.select_one("[class*='phone']") or card.find(string=re.compile(r"\(\d{3}\)"))
-        phone = phone_tag.get_text(strip=True) if hasattr(phone_tag, "get_text") else (
-            str(phone_tag).strip() if phone_tag else None
-        )
-
-        addr_tag = card.select_one("[class*='address']") or card.select_one("address")
-        address = addr_tag.get_text(" ", strip=True) if addr_tag else None
-
-        return {
-            "business_name": name,
-            "website_url": website,
-            "phone": phone,
-            "address": address,
-            "category": None,
-        }
-    except Exception as exc:
-        logger.debug("BBB parse error: %s", exc)
-        return None
+# NOTE: bbb.org sits behind an intermittent Cloudflare interstitial ("Just
+# a moment..." / "You have been blocked") — roughly 2 of every 3 attempts
+# made while fixing this hit the challenge instead of real results, but
+# the third got through. That real page was captured and used to verify
+# the selectors below directly (not guessed): the card container is
+# `div.result-card`, not the task spec's guessed `[data-card-type='biz']`/
+# `.MuiGrid-item` (BBB's real markup has neither — no MUI, no schema.org
+# itemprop attributes at all). Those guessed selectors are kept as
+# trailing fallbacks in case BBB's markup varies by result type, but the
+# first selector in each list below is confirmed against genuine BBB
+# output. One confirmed real-world gap: none of 15 real cards checked had
+# an external website link on the search-results page at all (only a
+# profile-page link, a "Get a Quote" link, and a tel: link) — BBB simply
+# doesn't expose it at this stage, so website_url will realistically stay
+# empty for BBB results regardless of selector; this is the same
+# documented limitation already noted for Yelp's _parse_yelp_listing. On
+# 0 results this now saves a debug screenshot to /tmp/bbb_debug.png
+# (POSIX path — meaningful on a real Linux VPS, not this Windows dev
+# sandbox) so an actual block vs. a markup change can be told apart.
+_BBB_WAIT_SELECTOR = "div.result-card, div[data-card-type='biz'], .MuiGrid-item"
+_BBB_CARD_SELECTOR = "div.result-card, div[data-card-type='biz'], .MuiGrid-item"
+_BBB_NAME_SELECTORS = ["h3.result-business-name", 'span[itemprop="name"]', "h3.MuiTypography-h3"]
+_BBB_PHONE_SELECTORS = ['a[href^="tel:"]', 'span[itemprop="telephone"]']
+_BBB_PHONE_FALLBACK_SELECTOR = "div.MuiBox-root > p"
+_BBB_ADDRESS_SELECTORS = ["p.text-size-5.text-gray-70"]
+_BBB_STREET_SELECTORS = ['span[itemprop="streetAddress"]']
+_BBB_LOCALITY_SELECTORS = ['span[itemprop="addressLocality"]']
+_BBB_CATEGORY_SELECTORS = ["p.text-size-4.text-gray-70"]
+_BBB_WEBSITE_SELECTORS = [
+    'a[data-testid="biz-website"]',
+    'a[href*="http"]:not([href*="bbb.org"])',
+]
+# Sponsored/ad listings (confirmed live) render an "advertisement:" label
+# as part of the same heading inner_text() reads the name from, e.g.
+# "advertisement:\nAbacus Plumbing, Air Conditioning & Electrical" — strip
+# it so it doesn't pollute the extracted business name.
+_BBB_AD_PREFIX_RE = re.compile(r"^advertisement:\s*", re.IGNORECASE)
 
 
 def _scrape_bbb_browser(
     niche: str, location: str, max_results: int, headless: bool = True, proxy: str | None = None,
 ) -> Iterator[dict]:
-    """Yield business dicts from the Better Business Bureau. UNVERIFIED —
-    see _parse_bbb_listing's note; degrades to zero results rather than
-    raising if BBB's Cloudflare challenge blocks the session.
+    """Yield business dicts from the Better Business Bureau. Selectors
+    confirmed against genuine real-world result markup (see module note
+    above); still degrades to zero results rather than raising when
+    BBB's intermittent Cloudflare challenge blocks a given session.
 
     Runs inside run_in_thread() — see _scrape_yellowpages_browser's
     docstring for why, and why results are collected rather than yielded
@@ -766,22 +875,55 @@ def _scrape_bbb_browser(
             human_delay()
 
             try:
-                page.wait_for_selector('[class*="result"]', timeout=10_000)
+                page.wait_for_load_state("networkidle", timeout=20_000)
             except Exception:
-                logger.warning("[BBB-Browser] No results rendered — likely blocked")
+                pass  # best-effort — still try the selector wait below
+
+            try:
+                page.wait_for_selector(_BBB_WAIT_SELECTOR, timeout=15_000)
+            except Exception:
+                logger.warning("[BBB-Browser] Selector timed out — likely blocked")
+                _take_debug_screenshot(page, "/tmp/bbb_debug.png", "BBB-Browser")
                 return results
 
             human_scroll(page)
-            soup = BeautifulSoup(page.content(), "lxml")
-            for card in soup.select('[class*="result-card"], [class*="search-result"]'):
-                biz = _parse_bbb_listing(card)
-                if not biz or biz["business_name"] in seen_names:
+            cards = page.query_selector_all(_BBB_CARD_SELECTOR)
+            logger.info("[BBB-Browser] Found %d business cards", len(cards))
+
+            for card in cards:
+                name = _BBB_AD_PREFIX_RE.sub("", _try_selectors(card, _BBB_NAME_SELECTORS)).strip()
+                if not name or name in seen_names:
                     continue
-                seen_names.add(biz["business_name"])
-                biz["source"] = "bbb"
+                seen_names.add(name)
+
+                phone = _try_selectors(card, _BBB_PHONE_SELECTORS)
+                if not phone:
+                    phone = _find_phone_like_text(card, _BBB_PHONE_FALLBACK_SELECTOR)
+
+                # Confirmed real markup combines the full address into one
+                # element; the itemprop street/locality split is kept as a
+                # fallback for a schema.org-marked-up variant, unverified.
+                address = _try_selectors(card, _BBB_ADDRESS_SELECTORS)
+                if not address:
+                    street = _try_selectors(card, _BBB_STREET_SELECTORS)
+                    locality = _try_selectors(card, _BBB_LOCALITY_SELECTORS)
+                    address = ", ".join(p for p in (street, locality) if p)
+
+                biz = {
+                    "business_name": name,
+                    "website_url": _try_selector_attr(card, _BBB_WEBSITE_SELECTORS, "href") or None,
+                    "phone": phone or None,
+                    "address": address or None,
+                    "category": _try_selectors(card, _BBB_CATEGORY_SELECTORS) or None,
+                    "source": "bbb",
+                }
+                logger.debug("[BBB-Browser] Extracted: %s", biz)
                 results.append(biz)
                 if len(results) >= max_results:
-                    return results
+                    break
+
+            if len(results) == 0:
+                _take_debug_screenshot(page, "/tmp/bbb_debug.png", "BBB-Browser")
 
         return results
 
@@ -794,51 +936,36 @@ def _scrape_bbb_browser(
     yield from results
 
 
-# NOTE: manta.com returned a direct 403 to a plain unproxied request while
-# building this scraper. The selectors below are a best-effort guess at
-# Manta's real markup, following this module's established fallback-chain
-# pattern; UNVERIFIED and may need adjustment against real markup.
-def _parse_manta_listing(card) -> dict | None:
-    """Parse a single Manta search result card. UNVERIFIED — see note above."""
-    try:
-        name_tag = (
-            card.select_one("h2.company-name")
-            or card.select_one("a.company-name")
-            or card.find(["h2", "h3"])
-        )
-        name = name_tag.get_text(strip=True) if name_tag else None
-        if not name:
-            return None
-
-        website_tag = card.select_one("a.website") or card.select_one("a[href^='http']:not([href*='manta.com'])")
-        website = website_tag.get("href") if website_tag else None
-
-        phone_tag = card.select_one("[class*='phone']")
-        phone = phone_tag.get_text(strip=True) if phone_tag else None
-
-        addr_tag = card.select_one("[class*='address']") or card.select_one("address")
-        address = addr_tag.get_text(" ", strip=True) if addr_tag else None
-
-        cat_tag = card.select_one("[class*='category']")
-        category = cat_tag.get_text(strip=True) if cat_tag else None
-
-        return {
-            "business_name": name,
-            "website_url": website,
-            "phone": phone,
-            "address": address,
-            "category": category,
-        }
-    except Exception as exc:
-        logger.debug("Manta parse error: %s", exc)
-        return None
+# NOTE: manta.com is a harder case than YP/BBB — most attempts hit a
+# Cloudflare "Just a moment..." challenge, but one attempt actually got
+# through to a real (non-challenged) page and still found 0 cards. That
+# page's body text read "We encountered an error while performing your
+# search." rather than showing any listings — i.e. this specific query
+# string (?search=X&location=Y, which does match the real homepage search
+# form's own field names/ids) reached Manta's real backend but didn't
+# return results the way a direct URL hit apparently expects. This looks
+# more like Manta's search needing the homepage form actually filled in
+# and submitted (a client-rendered flow) rather than a pure selector
+# problem, but that's a bigger rework than selectors alone and wasn't
+# confirmed either way in the time available. The selectors below still
+# follow the exact structure given in the task spec; UNVERIFIED against
+# real result markup, and on 0 results now saves a debug screenshot to
+# /tmp/manta_debug.png (POSIX path — meaningful on a real Linux VPS, not
+# this Windows dev sandbox) so an actual block vs. this "no results"
+# response can be told apart from a markup change.
+_MANTA_WAIT_SELECTOR = 'div.search-results, article.company-result, div[data-cy="company-card"]'
+_MANTA_CARD_SELECTOR = 'article.company-result, div[data-cy="company-card"]'
+_MANTA_NAME_SELECTORS = ["h2.company-name > a", 'a[data-cy="company-name"]']
+_MANTA_PHONE_SELECTORS = ["span.phone", 'div[data-cy="phone"]']
+_MANTA_ADDRESS_SELECTORS = ["span.address", 'div[data-cy="address"]']
+_MANTA_WEBSITE_SELECTORS = ['a[data-cy="website"]', "a.website-link"]
 
 
 def _scrape_manta_browser(
     niche: str, location: str, max_results: int, headless: bool = True, proxy: str | None = None,
 ) -> Iterator[dict]:
-    """Yield business dicts from Manta. UNVERIFIED — see _parse_manta_listing's
-    note; degrades to zero results rather than raising if blocked.
+    """Yield business dicts from Manta. UNVERIFIED — see the module note
+    above; degrades to zero results rather than raising if blocked.
 
     Runs inside run_in_thread() — see _scrape_yellowpages_browser's
     docstring for why, and why results are collected rather than yielded
@@ -862,22 +989,42 @@ def _scrape_manta_browser(
             human_delay()
 
             try:
-                page.wait_for_selector('[class*="company"]', timeout=10_000)
+                page.wait_for_load_state("networkidle", timeout=20_000)
             except Exception:
-                logger.warning("[Manta-Browser] No results rendered — likely blocked")
+                pass  # best-effort — still try the selector wait below
+
+            try:
+                page.wait_for_selector(_MANTA_WAIT_SELECTOR, timeout=15_000)
+            except Exception:
+                logger.warning("[Manta-Browser] Selector timed out — likely blocked")
+                _take_debug_screenshot(page, "/tmp/manta_debug.png", "Manta-Browser")
                 return results
 
             human_scroll(page)
-            soup = BeautifulSoup(page.content(), "lxml")
-            for card in soup.select('[class*="company-card"], [class*="result"]'):
-                biz = _parse_manta_listing(card)
-                if not biz or biz["business_name"] in seen_names:
+            cards = page.query_selector_all(_MANTA_CARD_SELECTOR)
+            logger.info("[Manta-Browser] Found %d company cards", len(cards))
+
+            for card in cards:
+                name = _try_selectors(card, _MANTA_NAME_SELECTORS)
+                if not name or name in seen_names:
                     continue
-                seen_names.add(biz["business_name"])
-                biz["source"] = "manta"
+                seen_names.add(name)
+
+                biz = {
+                    "business_name": name,
+                    "website_url": _try_selector_attr(card, _MANTA_WEBSITE_SELECTORS, "href") or None,
+                    "phone": _try_selectors(card, _MANTA_PHONE_SELECTORS) or None,
+                    "address": _try_selectors(card, _MANTA_ADDRESS_SELECTORS) or None,
+                    "category": None,
+                    "source": "manta",
+                }
+                logger.debug("[Manta-Browser] Extracted: %s", biz)
                 results.append(biz)
                 if len(results) >= max_results:
-                    return results
+                    break
+
+            if len(results) == 0:
+                _take_debug_screenshot(page, "/tmp/manta_debug.png", "Manta-Browser")
 
         return results
 
