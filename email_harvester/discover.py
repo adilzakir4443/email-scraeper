@@ -623,6 +623,18 @@ def _take_debug_screenshot(page, path: str, source_label: str) -> None:
         logger.debug("[%s] Screenshot failed: %s", source_label, exc)
 
 
+def _save_debug_html(page, path: str, source_label: str) -> None:
+    """Best-effort page-HTML dump alongside a debug screenshot — lets a
+    block page and a markup change be told apart without re-running live.
+    Never raises, same rationale as _take_debug_screenshot."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(page.content())
+        logger.warning("[%s] Page HTML saved to %s", source_label, path)
+    except Exception as exc:
+        logger.debug("[%s] HTML dump failed: %s", source_label, exc)
+
+
 _YP_CARD_SELECTOR = "div.result, div.v-card"
 _YP_NAME_SELECTORS = ["a.business-name > span", "h2.n > a"]
 _YP_PHONE_SELECTORS = ["div.phones.phone.primary", "p.phone"]
@@ -734,14 +746,108 @@ def _scrape_yellowpages_browser(
     yield from results
 
 
+# NOTE: yelp.com sits behind DataDome, a dedicated anti-bot service — not
+# a generic Cloudflare interstitial. Confirmed live, consistently across
+# 7 of 8 attempts made while fixing this (proxied and unproxied; the 8th
+# was a plain navigation timeout): the response is a near-empty page
+# (title literally "yelp.com", ~1.6KB) embedding an
+# <iframe src="https://geo.captcha-delivery.com/captcha/?..."> — DataDome's
+# CAPTCHA challenge. This is the exact scenario the task's own spec
+# anticipated ("if it's a CAPTCHA page, Yelp requires residential proxies
+# — no workaround without them"). One concrete finding from capturing that
+# real page: its <title> is plain "yelp.com", containing none of
+# "access denied"/"robot"/"captcha"/"blocked" — a title-only check
+# (as originally specified) would silently miss this real block entirely.
+# _is_yelp_blocked() below also checks for the captcha-delivery.com iframe
+# directly, which is what actually caught it. The card/field selectors
+# below are UNVERIFIED against real result markup, since no attempt here
+# ever got past DataDome to a real results page.
+_YELP_WAIT_SELECTOR = 'div[data-testid="serp-ia-card"], li.y-css-1iy9ks6'
+_YELP_CARD_SELECTOR_CHAIN = [
+    "div[data-testid='serp-ia-card']",
+    "li.y-css-1iy9ks6",
+    "div.businessName__09f24__EYSZE",
+    "div[class*='businessName']",
+]
+_YELP_NAME_SELECTORS = ["a[class*='businessName']", "h3 > a[name]", "span[class*='display-name']"]
+_YELP_ADDRESS_SELECTORS = ["address > p", "span[class*='raw-text']", "p[class*='address']"]
+_YELP_CATEGORY_SELECTORS = ["span[class*='category']", "a[class*='category-str-list']"]
+_YELP_RATING_SELECTOR = "div[aria-label*='star rating']"
+_YELP_BLOCK_TITLE_MARKERS = ("access denied", "robot", "captcha", "blocked")
+_YELP_BLOCK_CONTENT_MARKERS = ("captcha-delivery.com", "datadome")
+
+_YELP_EXTRA_HEADERS = {
+    "Referer": "https://www.google.com/",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def _is_yelp_blocked(page) -> bool:
+    """True if this page is Yelp's bot/CAPTCHA challenge rather than real
+    results. Checks the title markers the task spec suggested, plus the
+    DataDome iframe/content signal confirmed live — see the module note
+    above for why the title check alone isn't enough."""
+    try:
+        title = (page.title() or "").lower()
+        if any(marker in title for marker in _YELP_BLOCK_TITLE_MARKERS):
+            return True
+    except Exception:
+        pass
+    try:
+        if page.query_selector("div#captcha-container, div.yelp-error"):
+            return True
+    except Exception:
+        pass
+    try:
+        if page.query_selector('iframe[src*="captcha-delivery"]'):
+            return True
+    except Exception:
+        pass
+    try:
+        html_lower = page.content().lower()
+        if any(marker in html_lower for marker in _YELP_BLOCK_CONTENT_MARKERS):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _extract_yelp_cards(page):
+    """Try each card selector in priority order, return the first that
+    matches anything (mirrors _try_selectors' fallback-chain approach, but
+    for finding the repeating card list itself rather than a field)."""
+    for selector in _YELP_CARD_SELECTOR_CHAIN:
+        cards = page.query_selector_all(selector)
+        if cards:
+            return cards
+    return []
+
+
+def _extract_yelp_rating(card) -> str:
+    try:
+        el = card.query_selector(_YELP_RATING_SELECTOR)
+        if el:
+            label = el.get_attribute("aria-label")
+            if label:
+                return label.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _scrape_yelp_browser(
     niche: str, location: str, max_results: int, headless: bool = True, proxy: str | None = None,
 ) -> Iterator[dict]:
-    """Browser-rendered retry for Yelp, reusing _parse_yelp_listing — which
-    deliberately never captures a website_url from the search card (see its
-    docstring: Yelp's card links to Yelp's own listing page, never the real
-    business site, so this doesn't try to extract an "external link" either,
-    despite that otherwise being available on a rendered card).
+    """Browser-rendered retry for Yelp. UNVERIFIED against real result
+    markup — see the module note above; this sandbox never got past
+    Yelp's DataDome challenge. Neither phone nor website_url is captured
+    here: Yelp doesn't show either on the search card itself (phone is
+    found by the CRAWL stage once a site is known; website_url is left
+    for RESOLVE's business-name search, same reasoning already documented
+    on _parse_yelp_listing for the httpx-based scraper).
 
     Runs inside run_in_thread() — see _scrape_yellowpages_browser's
     docstring for why, and why results are collected rather than yielded
@@ -760,40 +866,98 @@ def _scrape_yelp_browser(
 
         with BrowserSession(headless=headless, proxy=parse_proxy_for_playwright(proxy)) as session:
             page = session.new_page()
+            try:
+                page.set_extra_http_headers(_YELP_EXTRA_HEADERS)
+            except Exception:
+                pass
+
             if not safe_goto(page, url):
+                _take_debug_screenshot(page, "/tmp/yelp_debug.png", "Yelp-Browser")
+                _save_debug_html(page, "/tmp/yelp_debug.html", "Yelp-Browser")
                 return results
-            human_delay()
 
-            for _ in range(10):
-                try:
-                    page.wait_for_selector('li[class*="border-color"]', timeout=10_000)
-                except Exception:
-                    break
+            try:
+                page.wait_for_load_state("networkidle", timeout=25_000)
+            except Exception:
+                pass  # best-effort — still proceed to the checks below
 
-                human_scroll(page)
-                soup = BeautifulSoup(page.content(), "lxml")
-                cards = soup.select("ul.undefined > li") or soup.select('li[class*="border-color"]')
-                if not cards:
-                    break
+            # Human-like pacing before touching the page content.
+            try:
+                page.mouse.move(random.randint(100, 800), random.randint(100, 500))
+            except Exception:
+                pass
+            time.sleep(random.uniform(0.5, 1.5))
+            human_scroll(page, times=2)
+            time.sleep(random.uniform(1.0, 2.5))
+
+            if _is_yelp_blocked(page):
+                logger.warning("[Yelp-Browser] Blocked by CAPTCHA/bot detection")
+                _take_debug_screenshot(page, "/tmp/yelp_blocked.png", "Yelp-Browser")
+                return results
+
+            try:
+                page.wait_for_selector(_YELP_WAIT_SELECTOR, timeout=15_000)
+            except Exception:
+                logger.warning("[Yelp-Browser] Selector timed out — no results page detected")
+                _take_debug_screenshot(page, "/tmp/yelp_debug.png", "Yelp-Browser")
+                _save_debug_html(page, "/tmp/yelp_debug.html", "Yelp-Browser")
+                return results
+
+            for _ in range(10):  # page-click cap so a stuck "Next" can't loop forever
+                # Scroll to trigger any lazy-loaded cards before (re-)querying.
+                for _ in range(3):
+                    try:
+                        page.evaluate("window.scrollBy(0, 800)")
+                    except Exception:
+                        break
+                    time.sleep(random.uniform(1.0, 2.0))
+
+                cards = _extract_yelp_cards(page)
+                logger.info("[Yelp-Browser] Found %d result cards", len(cards))
 
                 for card in cards:
-                    biz = _parse_yelp_listing(card)
-                    if not biz or biz["business_name"] in seen_names:
+                    name = _try_selectors(card, _YELP_NAME_SELECTORS)
+                    if not name or name in seen_names:
                         continue
-                    seen_names.add(biz["business_name"])
-                    biz["source"] = "yelp"
+                    seen_names.add(name)
+
+                    category = _try_selectors(card, _YELP_CATEGORY_SELECTORS)
+                    rating = _extract_yelp_rating(card)
+                    if rating:
+                        category = f"{category} {rating}" if category else rating
+
+                    biz = {
+                        "business_name": name,
+                        "website_url": None,
+                        "phone": None,
+                        "address": _try_selectors(card, _YELP_ADDRESS_SELECTORS) or None,
+                        "category": category or None,
+                        "source": "yelp",
+                    }
+                    logger.debug("[Yelp-Browser] Extracted: %s", biz)
                     results.append(biz)
                     if len(results) >= max_results:
-                        return results
+                        break
 
-                next_btn = page.locator('a[aria-label="Next"]').first
-                if next_btn.count() == 0:
+                if len(results) >= max_results:
+                    break
+
+                next_btn = (
+                    page.query_selector("a[aria-label='Next']")
+                    or page.query_selector("a.next-link")
+                    or page.query_selector("a[class*='pagination-link_anchor'][rel='next']")
+                )
+                if next_btn is None:
                     break
                 try:
                     next_btn.click()
                     human_delay()
                 except Exception:
                     break
+
+            if len(results) == 0:
+                _take_debug_screenshot(page, "/tmp/yelp_debug.png", "Yelp-Browser")
+                _save_debug_html(page, "/tmp/yelp_debug.html", "Yelp-Browser")
 
         return results
 
