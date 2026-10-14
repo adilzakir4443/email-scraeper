@@ -141,6 +141,17 @@ def _fetch_page(
             # 404/410 etc — page doesn't exist, stop trying
             logger.debug("HTTP %d for %s — skipping", resp.status_code, url)
             return None, "invalid_url", f"HTTP {resp.status_code}"
+        except httpx.ProxyError as exc:
+            # Confirmed live: an authenticated proxy rejecting an HTTPS
+            # (CONNECT-tunnel) request raises this as an EXCEPTION, not a
+            # normal Response with status_code==407 — the 407 handling
+            # above only ever sees that for plain HTTP targets. httpx.
+            # ProxyError is a sibling of ConnectError, not a subclass of
+            # it, so it needed its own except clause; without one this
+            # propagated uncaught and crashed the whole run.
+            pool.mark_407(proxy)
+            logger.warning("Proxy auth failed for %s: %s — check proxy credentials", url, exc)
+            return None, "blocked", "HTTP 407"  # don't retry — won't fix itself with the same proxy
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
             logger.debug("Fetch error %s: %s (attempt %d)", url, exc, attempt)
             last_status, last_error = "temp_failed", str(exc)

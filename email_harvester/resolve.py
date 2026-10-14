@@ -118,6 +118,23 @@ def _resolve_one(url: str) -> Optional[str]:
                         pool.report_success(attempt_proxy)
                     logger.debug("[RESOLVE] %s — using %s", url, label)
                     return final_url
+            except httpx.ProxyError as exc:
+                # Confirmed live: an authenticated proxy rejecting an
+                # HTTPS (CONNECT-tunnel) request raises this as an
+                # EXCEPTION, not a normal Response with status_code==407
+                # — the 407 handling above only ever sees that for plain
+                # HTTP targets. httpx.ProxyError is a sibling of
+                # ConnectError, not a subclass of it, so it needed its own
+                # except clause; the broad `except Exception` below would
+                # already have caught it without crashing, but silently,
+                # without the mark_407 tracking/diagnostics every other
+                # 407 path in this codebase gets.
+                if attempt_proxy:
+                    pool.mark_407(attempt_proxy)
+                logger.warning(
+                    "Proxy auth failed for %s (%s): %s — check proxy credentials", url, label, exc
+                )
+                break  # don't retry with the same proxy — try the next candidate
             except (httpx.ConnectError, httpx.TimeoutException, httpx.TooManyRedirects) as exc:
                 logger.debug("Resolve attempt %d (%s) failed for %s: %s", attempt, label, url, exc)
                 if attempt_proxy:
