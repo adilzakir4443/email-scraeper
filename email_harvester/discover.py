@@ -1548,26 +1548,69 @@ def _scrape_thomson_local(niche: str, location: str, max_results: int) -> Iterat
 
 _NICHE_SYNONYMS: dict[str, list[str]] = {
     "plumber": ["plumber", "plumbing", "pipe", "drain", "sewer"],
-    "dentist": ["dentist", "dental", "orthodont", "teeth", "tooth"],
-    "lawyer": ["lawyer", "attorney", "law firm", "legal", "solicitor"],
-    "electrician": ["electrician", "electric", "electrical", "wiring"],
-    "restaurant": ["restaurant", "cafe", "diner", "eatery", "bistro", "grill"],
+    "dentist": ["dentist", "dental", "orthodont", "teeth", "tooth", "smile"],
+    "lawyer": ["lawyer", "attorney", "law firm", "legal", "solicitor", "law"],
+    "electrician": ["electrician", "electric", "electrical", "wiring", "power"],
+    "restaurant": ["restaurant", "cafe", "diner", "eatery", "bistro", "grill", "food", "kitchen"],
     "accountant": ["accountant", "accounting", "bookkeep", "cpa", "tax"],
+    # Added for the real-world bug this entry fixes: "beauty salon" fell
+    # through to the generic 5-char-stem fallback ("beaut") below, which a
+    # genuinely relevant category like "Hair Salon" or "Nail Salon" never
+    # contains as a substring — every such result was getting dropped.
+    "beauty salon": [
+        "beauty", "salon", "hair", "nail", "spa", "aesthet", "cosmet",
+        "barber", "wax", "lash", "brow",
+    ],
+    "hair salon": ["hair", "salon", "barber", "cut", "style", "color", "beauty"],
+    "nail salon": ["nail", "salon", "manicure", "pedicure", "beauty"],
+    "spa": ["spa", "massage", "wellness", "relax", "facial", "beauty"],
+    "gym": ["gym", "fitness", "crossfit", "yoga", "pilates", "sport", "health"],
+    "sticker": ["sticker", "print", "dtf", "vinyl", "sign", "label", "decal", "custom"],
+    "dtf": ["dtf", "print", "transfer", "sticker", "vinyl", "custom"],
 }
 
 
-def _niche_keywords(niche: str) -> list[str]:
+def _lookup_niche_synonyms(niche_lower: str) -> list[str] | None:
     """
-    Return the keyword list to match a niche's businesses against. Checks
-    the synonym map first — matching either the exact word or its stripped
-    plural ("plumbers" -> "plumber" entry) — and falls back to the
-    niche string's own first-5-character stem for anything not mapped.
+    Return the synonym list for niche_lower if it's a recognized niche, or
+    None if it isn't mapped at all. Checks the FULL niche phrase first
+    (exact, or with a trailing "s" stripped — "nail salons" -> "nail
+    salon"), since a multi-word key like "beauty salon" or "hair salon"
+    would never be found by only ever testing individual words; falls
+    back to testing each individual word (again exact or de-pluralized).
     """
-    niche_lower = niche.lower().strip()
+    for candidate in (niche_lower, niche_lower.rstrip("s")):
+        if candidate in _NICHE_SYNONYMS:
+            return _NICHE_SYNONYMS[candidate]
+
     for word in re.findall(r"[a-z]+", niche_lower):
         for candidate in (word, word.rstrip("s")):
             if candidate in _NICHE_SYNONYMS:
                 return _NICHE_SYNONYMS[candidate]
+
+    return None
+
+
+def _niche_keywords(niche: str) -> list[str]:
+    """
+    Return the keyword list to match a niche's businesses against: the
+    synonym map's entry if the niche is recognized, otherwise the niche
+    string's own first-5-character stem as a last resort.
+
+    This stem fallback is unreliable in both directions — it can
+    coincidentally match something unrelated, and (the more common and
+    more harmful failure, since it silently drops real leads) it very
+    often DOESN'T match a genuinely relevant category that just doesn't
+    happen to contain that exact 5-character substring. _is_relevant
+    below never actually trusts this fallback's match result for that
+    reason — it only calls this for the keyword LIST itself; whether the
+    niche was recognized at all is checked separately via
+    _lookup_niche_synonyms.
+    """
+    niche_lower = niche.lower().strip()
+    synonyms = _lookup_niche_synonyms(niche_lower)
+    if synonyms is not None:
+        return synonyms
     stem = niche_lower[:5].strip()
     return [stem] if stem else [niche_lower]
 
@@ -1578,26 +1621,47 @@ def _is_relevant(
     """
     Check whether a scraped listing plausibly matches the requested niche.
 
-    Returns (is_relevant, checked) rather than a bare bool, since the two
-    outcomes that both "keep the record" need to be distinguishable from
-    each other downstream (relevance_checked is persisted on the row):
+    Returns (is_relevant, checked) rather than a bare bool, since the
+    outcomes that keep the record need to be distinguishable from each
+    other downstream (relevance_checked is persisted on the row):
       - (True,  True)  — a niche keyword was found in the name or category:
                           confidently relevant.
-      - (True,  False) — no category at all, and no keyword match in the
-                          name either: too little information to judge, so
-                          it's kept but flagged as unchecked/uncertain
-                          rather than silently dropped.
-      - (False, True)  — a category is present but doesn't match any niche
-                          keyword (e.g. niche=plumbers, category=restaurant)
-                          — treated as a contradiction and dropped. Simple
-                          keyword matching can't distinguish "genuinely
-                          contradicts" from "just an unmapped category
-                          wording", so any non-matching-but-present category
-                          is treated the same conservative way.
+      - (True,  False) — niche isn't in the synonym map at all, OR it is
+                          but there's no category and no name match: too
+                          little information to judge, so it's kept but
+                          flagged as unchecked/uncertain rather than
+                          silently dropped. An UNMAPPED niche always lands
+                          here, never in the dropped case below — the only
+                          "keyword" available for one is the unreliable
+                          5-character stem _niche_keywords falls back to,
+                          and that heuristic fails far more often by NOT
+                          matching a genuinely relevant category (e.g.
+                          category="Hair Salon" vs the stem "beaut" for
+                          niche="beauty salon", before "beauty salon" got
+                          its own map entry) than it does by coincidentally
+                          over-matching — so it must never be trusted to
+                          justify dropping a result outright.
+      - (False, True)  — niche IS in the synonym map, a category is
+                          present, but neither it nor the name contains any
+                          of the niche's mapped synonyms or its own words
+                          (e.g. niche=plumbers, category=restaurant) —
+                          treated as a genuine contradiction and dropped.
     """
-    keywords = _niche_keywords(niche)
+    niche_lower = niche.lower().strip()
+    synonyms = _lookup_niche_synonyms(niche_lower)
     name_lower = (business_name or "").lower()
     category_lower = (category or "").lower()
+
+    if synonyms is None:
+        logger.debug("[RELEVANCE] Unknown niche %r — keeping all results", niche)
+        return True, False
+
+    # Match the synonym list, plus each individual word of the niche
+    # phrase itself (>= 4 chars, to skip noise words like "and"/"a") —
+    # belt-and-suspenders on top of the synonym map, for a mapped niche
+    # whose own list doesn't happen to restate one of its own words.
+    niche_words = [w for w in re.findall(r"[a-z]+", niche_lower) if len(w) >= 4]
+    keywords = synonyms + niche_words
 
     if any(kw in name_lower for kw in keywords) or any(kw in category_lower for kw in keywords):
         return True, True
