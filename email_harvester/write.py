@@ -1,17 +1,20 @@
 """
 Stage 4b — WRITE.
 
-Reads verified emails from SQLite, applies suppression list,
-deduplicates (by email then by domain), and writes an Excel file with three
-sheets, each business landing in exactly one of them:
+Reads verified emails from SQLite, applies suppression list, deduplicates
+by exact email address, and writes an Excel file with three sheets, each
+business landing in exactly one of them:
   "Leads"                  — has a verified email (tier acceptable/risky).
   "No Website"             — RESOLVE actually confirmed no site exists
                               (resolve_status='no_site'), not just "hasn't
                               been checked yet" — SOCIAL's Bing-search
                               fallback is these businesses' only source of
                               contact info besides phone.
-  "Has Website, No Email"  — has a site, CRAWL ran against it, but found no
-                              email at all; a manual-follow-up list.
+  "Has Website, No Email"  — has a site, and either CRAWL ran against it and
+                              found no email at all, or its only email is
+                              stuck at tier='unverified' (a DNS lookup that
+                              hasn't resolved either way yet) — a manual-
+                              follow-up list.
 
 Sheet 1 columns (exact order):
   Company Name | Owner Name | Phone | Category | Email | Website |
@@ -21,10 +24,16 @@ Sheet 2 columns (exact order):
   Company Name | Phone | Category | Address | Facebook | Instagram | LinkedIn
 
 Sheet 3 columns (exact order):
-  Company Name | Phone | Category | Website | Address | Facebook | Instagram | LinkedIn
+  Company Name | Phone | Category | Website | Address | Facebook | Instagram |
+  LinkedIn | Comment
 
 Comment format:
   mx_status=acceptable; role=false; source=yellowpages
+
+Every string cell (everything except the Email column) is passed through
+_safe_cell() before being written, to stop a scraped value that happens to
+start with =, +, @, a tab, or a carriage return from being interpreted as
+an Excel formula when the file is opened.
 """
 
 import csv
@@ -76,6 +85,7 @@ NO_EMAIL_COLUMNS = [
     "Facebook",
     "Instagram",
     "LinkedIn",
+    "Comment",
 ]
 
 # Tiers to include in output (invalid is dropped entirely)
@@ -158,41 +168,44 @@ def _build_comment(row: sqlite3.Row) -> str:
     return "; ".join(parts)
 
 
-def _domain_of(email: str) -> str:
-    try:
-        return email.lower().split("@", 1)[1]
-    except IndexError:
-        return ""
-
-
 def _deduplicate(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
     """
-    Deduplicate: first by exact email, then keep only one email per domain
-    (prefer acceptable over risky; if same tier prefer shorter email).
+    Deduplicate by exact email address only.
+
+    This used to also keep only one email per domain (step 2), on the
+    assumption that multiple emails sharing a domain were the same
+    business. That's wrong whenever the shared domain is a free provider
+    like gmail.com: a plumber and a dentist can both legitimately use
+    gmail.com, and the old step 2 would silently drop one of them as a
+    "duplicate" — a real lead lost, not a true duplicate.
     """
-    # Step 1: unique by email (rows already have unique emails from DB UNIQUE constraint,
-    # but we might have same email from multiple businesses — keep first)
     seen_emails: set[str] = set()
-    unique_by_email: list[sqlite3.Row] = []
+    result: list[sqlite3.Row] = []
     for row in rows:
         key = row["email"].lower()
         if key not in seen_emails:
             seen_emails.add(key)
-            unique_by_email.append(row)
+            result.append(row)
+    return result
 
-    # Step 2: one email per domain — keep best-tier entry
-    tier_rank = {"acceptable": 0, "risky": 1, "invalid": 2}
-    best_by_domain: dict[str, sqlite3.Row] = {}
-    for row in unique_by_email:
-        domain = _domain_of(row["email"])
-        existing = best_by_domain.get(domain)
-        if existing is None:
-            best_by_domain[domain] = row
-        else:
-            if tier_rank.get(row["tier"], 9) < tier_rank.get(existing["tier"], 9):
-                best_by_domain[domain] = row
 
-    return list(best_by_domain.values())
+def _safe_cell(value) -> str:
+    """
+    Prevent Excel/CSV formula injection: a cell value starting with
+    =, +, @, a tab, or a carriage return is interpreted as a formula by
+    Excel when the file is opened (or re-exported to CSV), which lets a
+    scraped business name/address/etc. run arbitrary formulas/commands in
+    whoever opens this sheet. Prefixing with a single quote forces Excel
+    to treat it as literal text instead. Never applied to the email
+    column — an email address can't start with any of these characters,
+    so there's nothing to protect there and no reason to risk mangling it.
+    """
+    if not value:
+        return value or ""
+    s = str(value)
+    if s.startswith(("=", "+", "@", "\t", "\r")):
+        return "'" + s
+    return s
 
 
 def _style_header(ws) -> None:
@@ -467,17 +480,17 @@ def run_write(
 
         ws.append(
             [
-                row["business_name"],
+                _safe_cell(row["business_name"]),
                 "",                      # Owner Name — intentionally blank
-                row["phone"] or "",
-                row["category"] or "",
-                row["email"],
-                website,
-                row["facebook_url"] or "",
-                row["instagram_url"] or "",
-                row["linkedin_url"] or "",
-                row["address"] or "",
-                comment,
+                _safe_cell(row["phone"] or ""),
+                _safe_cell(row["category"] or ""),
+                row["email"],            # email — never prefixed, can't start with a formula char anyway
+                _safe_cell(website),
+                _safe_cell(row["facebook_url"] or ""),
+                _safe_cell(row["instagram_url"] or ""),
+                _safe_cell(row["linkedin_url"] or ""),
+                _safe_cell(row["address"] or ""),
+                _safe_cell(comment),
             ]
         )
 
@@ -580,13 +593,13 @@ def run_write(
 
         ws2.append(
             [
-                row["business_name"],
-                row["phone"] or "",
-                row["category"] or "",
-                row["address"] or "",
-                row["facebook_url"] or "",
-                row["instagram_url"] or "",
-                row["linkedin_url"] or "",
+                _safe_cell(row["business_name"]),
+                _safe_cell(row["phone"] or ""),
+                _safe_cell(row["category"] or ""),
+                _safe_cell(row["address"] or ""),
+                _safe_cell(row["facebook_url"] or ""),
+                _safe_cell(row["instagram_url"] or ""),
+                _safe_cell(row["linkedin_url"] or ""),
             ]
         )
         existing_no_website.add(key)
@@ -600,23 +613,40 @@ def run_write(
         no_website_appended, no_website_skipped,
     )
 
-    # Sheet 3 — has a website, CRAWL actually ran against it (excludes ones
-    # still crawl_status='pending', which just haven't been processed yet
-    # and would otherwise misleadingly look like "checked, found nothing"),
-    # but zero emails were found at all. A manual-follow-up list, distinct
-    # from "No Website" — these businesses DO have a site, just no email.
+    # Sheet 3 — has a website, and either:
+    #   (a) CRAWL actually ran against it (excludes still-pending ones,
+    #       which just haven't been processed yet and would otherwise
+    #       misleadingly look like "checked, found nothing") and found
+    #       zero emails at all, or
+    #   (b) has an email that's stuck at tier='unverified' (a DNS lookup
+    #       that failed rather than resolved either way — see verify.py:
+    #       verified_at is deliberately left NULL on these so VERIFY keeps
+    #       retrying them, but they still need to show up *somewhere* in
+    #       the meantime rather than vanishing from every sheet).
+    # A manual-follow-up list, distinct from "No Website" — these
+    # businesses DO have a site, just no usable email yet.
     with get_conn(db_path) as conn:
         no_email_rows = conn.execute(
             """
-            SELECT business_name, phone, category, address,
-                   normalized_url AS website, website_url AS website_raw,
-                   facebook_url, instagram_url, linkedin_url
+            SELECT b.business_name, b.phone, b.category, b.address,
+                   b.normalized_url AS website, b.website_url AS website_raw,
+                   b.facebook_url, b.instagram_url, b.linkedin_url,
+                   CASE WHEN EXISTS (
+                       SELECT 1 FROM emails e
+                       WHERE e.business_id = b.id AND e.tier = 'unverified'
+                   ) THEN 'dns_error — retry next run' ELSE '' END AS comment
             FROM businesses b
-            WHERE (website_url IS NOT NULL OR normalized_url IS NOT NULL)
-              AND crawl_status != 'pending'
-              AND niche = ? AND location = ?
-              AND NOT EXISTS (SELECT 1 FROM emails e WHERE e.business_id = b.id)
-            ORDER BY business_name ASC
+            WHERE (b.website_url IS NOT NULL OR b.normalized_url IS NOT NULL)
+              AND b.niche = ? AND b.location = ?
+              AND (
+                (b.crawl_status != 'pending'
+                 AND NOT EXISTS (SELECT 1 FROM emails e WHERE e.business_id = b.id))
+                OR EXISTS (
+                    SELECT 1 FROM emails e
+                    WHERE e.business_id = b.id AND e.tier = 'unverified'
+                )
+              )
+            ORDER BY b.business_name ASC
             """,
             (niche, location),
         ).fetchall()
@@ -655,14 +685,15 @@ def run_write(
         website = row["website"] or row["website_raw"] or ""
         ws3.append(
             [
-                row["business_name"],
-                row["phone"] or "",
-                row["category"] or "",
-                website,
-                row["address"] or "",
-                row["facebook_url"] or "",
-                row["instagram_url"] or "",
-                row["linkedin_url"] or "",
+                _safe_cell(row["business_name"]),
+                _safe_cell(row["phone"] or ""),
+                _safe_cell(row["category"] or ""),
+                _safe_cell(website),
+                _safe_cell(row["address"] or ""),
+                _safe_cell(row["facebook_url"] or ""),
+                _safe_cell(row["instagram_url"] or ""),
+                _safe_cell(row["linkedin_url"] or ""),
+                _safe_cell(row["comment"] or ""),
             ]
         )
         existing_no_email.add(key)

@@ -371,6 +371,8 @@ def _find_social_no_website(
 
 def run_social(
     db_path: str,
+    niche: str | None = None,
+    location: str | None = None,
     api_fallback: bool = False,
     google_api_key: str | None = None,
     google_cx: str | None = None,
@@ -378,6 +380,10 @@ def run_social(
     """
     Stage 3b: find Facebook/Instagram/LinkedIn links for each business.
     Skips businesses whose social_status is already 'done'.
+
+    niche/location restrict this to one campaign's businesses — a plain
+    `? IS NULL OR column=?` pair for each, so the default (both None)
+    processes everything pending, same as before this parameter existed.
     """
     logger.info("=== STAGE 3b: SOCIAL ===")
 
@@ -387,7 +393,10 @@ def run_social(
             SELECT id, business_name, location, normalized_url, website_url
             FROM businesses
             WHERE social_status != 'done'
-            """
+              AND (? IS NULL OR niche = ?)
+              AND (? IS NULL OR location = ?)
+            """,
+            (niche, niche, location, location),
         ).fetchall()
 
     total = len(rows)
@@ -400,7 +409,11 @@ def run_social(
         biz_id: int = row["id"]
         site_url = row["normalized_url"] or row["website_url"]
         business_name: str = row["business_name"]
-        location: str = row["location"]
+        # Deliberately NOT named `location` — that would shadow this
+        # function's own `location` parameter (same footgun fixed in
+        # resolve.py's run_resolve, even though nothing after this loop
+        # currently reads the parameter again — better not to rely on that).
+        biz_location: str = row["location"]
 
         logger.info("[SOCIAL] (%d/%d) %s", i, total, business_name)
 
@@ -408,7 +421,7 @@ def run_social(
             social = _extract_from_website(site_url) if site_url else None
             if not social or not any(social.values()):
                 social = _find_social_no_website(
-                    business_name, location, api_fallback, google_api_key, google_cx
+                    business_name, biz_location, api_fallback, google_api_key, google_cx
                 )
         except Exception as exc:
             logger.error("[SOCIAL] Unhandled error for %s: %s", business_name, exc)

@@ -66,8 +66,12 @@ def _configure_logging(verbose: bool) -> None:
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
-@click.option("--niche",    required=True,  help='Business type to search, e.g. "plumbers"')
-@click.option("--location", required=True,  help='City + state, e.g. "Austin, TX"')
+@click.option("--config",   "config_path",  default=None,
+              help="YAML config file — CLI flags override file values")
+@click.option("--niche",    "niche",        default="",
+              help='Business type to search, e.g. "plumbers" (required, unless set in --config)')
+@click.option("--location", "location",     default="",
+              help='City + state, e.g. "Austin, TX" (required, unless set in --config)')
 @click.option("--max",      "max_results",  default=100, show_default=True,
               help="Maximum listings to discover across all sources")
 @click.option("--db",       "db_path",      default="harvester.db", show_default=True,
@@ -96,6 +100,7 @@ def _configure_logging(verbose: bool) -> None:
 @click.option("--verbose",  "-v",           is_flag=True, default=False,
               help="Enable DEBUG logging")
 def main(
+    config_path: Optional[str],
     niche: str,
     location: str,
     max_results: int,
@@ -152,9 +157,52 @@ def main(
 
     # Browser + API fallback (maximum coverage):
         email-harvester --niche "plumbers" --location "Austin, TX" --browser --api-fallback
+
+    # From a config file (see config.example.yaml) — any flag given on the
+    # command line still overrides the matching value in the file:
+        email-harvester --config config.example.yaml
     """
     _configure_logging(verbose)
     logger = logging.getLogger(__name__)
+
+    if config_path:
+        try:
+            import yaml
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception as exc:
+            raise click.ClickException(f"Cannot read config file: {exc}")
+
+        # Apply config values only where the CLI did not provide one —
+        # Click's own defaults (empty string / None / False / "all" / 100 /
+        # "harvester.db") are what distinguish "not passed on the command
+        # line" from "the user actually typed this value", so a flag given
+        # on the command line always wins over the file.
+        if niche == "" and "niche" in cfg:
+            niche = cfg["niche"]
+        if location == "" and "location" in cfg:
+            location = cfg["location"]
+        if max_results == 100 and "max" in cfg:
+            max_results = int(cfg["max"])
+        if db_path == "harvester.db" and "db" in cfg:
+            db_path = cfg["db"]
+        if out_path is None and "out" in cfg:
+            out_path = cfg["out"]
+        if suppress_path is None and "suppress" in cfg:
+            suppress_path = cfg["suppress"]
+        if not browser_mode and cfg.get("browser"):
+            browser_mode = True
+        if not api_fallback and cfg.get("api_fallback"):
+            api_fallback = True
+        if stage == "all" and "stage" in cfg:
+            stage = cfg["stage"]
+        if proxy_pool is None and "proxy_pool" in cfg:
+            proxy_pool = cfg["proxy_pool"]
+
+    if not niche or not location:
+        raise click.ClickException(
+            "--niche and --location are required (directly, or via --config)"
+        )
 
     # Initialise proxy pool
     from . import proxy as proxy_mod
@@ -222,24 +270,24 @@ def main(
     if stage in ("all", "resolve"):
         from .resolve import run_resolve
         run_resolve(
-            db_path,
+            db_path, niche=niche, location=location,
             api_fallback=api_fallback, google_api_key=google_api_key, google_cx=google_cx,
         )
 
     if stage in ("all", "crawl"):
         from .crawl import run_crawl
-        run_crawl(db_path)
+        run_crawl(db_path, niche=niche, location=location)
 
     if stage in ("all", "social"):
         from .social import run_social
         run_social(
-            db_path,
+            db_path, niche=niche, location=location,
             api_fallback=api_fallback, google_api_key=google_api_key, google_cx=google_cx,
         )
 
     if stage in ("all", "verify"):
         from .verify import run_verify
-        run_verify(db_path)
+        run_verify(db_path, niche=niche, location=location)
 
     if stage in ("all", "write"):
         from .write import run_write
@@ -255,28 +303,58 @@ def main(
     if stage == "all":
         from .db import get_conn
         with get_conn(db_path) as conn:
-            total_biz = conn.execute(
+            total = conn.execute(
                 "SELECT COUNT(*) FROM businesses WHERE niche=? AND location=?",
                 (niche, location),
             ).fetchone()[0]
+            with_site = conn.execute(
+                "SELECT COUNT(*) FROM businesses WHERE niche=? AND location=? AND normalized_url IS NOT NULL",
+                (niche, location),
+            ).fetchone()[0]
+            no_site = conn.execute(
+                "SELECT COUNT(*) FROM businesses WHERE niche=? AND location=? AND resolve_status='no_site'",
+                (niche, location),
+            ).fetchone()[0]
+            blocked = conn.execute(
+                "SELECT COUNT(*) FROM businesses WHERE niche=? AND location=? AND crawl_status='blocked'",
+                (niche, location),
+            ).fetchone()[0]
+            temp_failed = conn.execute(
+                "SELECT COUNT(*) FROM businesses WHERE niche=? AND location=? AND crawl_status='temp_failed'",
+                (niche, location),
+            ).fetchone()[0]
+            emails_raw = conn.execute(
+                """SELECT COUNT(*) FROM emails e JOIN businesses b ON b.id=e.business_id
+                   WHERE b.niche=? AND b.location=?""",
+                (niche, location),
+            ).fetchone()[0]
             acceptable = conn.execute(
-                """SELECT COUNT(*) FROM emails e
-                   JOIN businesses b ON b.id=e.business_id
+                """SELECT COUNT(*) FROM emails e JOIN businesses b ON b.id=e.business_id
                    WHERE b.niche=? AND b.location=? AND e.tier='acceptable'""",
                 (niche, location),
             ).fetchone()[0]
             risky = conn.execute(
-                """SELECT COUNT(*) FROM emails e
-                   JOIN businesses b ON b.id=e.business_id
+                """SELECT COUNT(*) FROM emails e JOIN businesses b ON b.id=e.business_id
                    WHERE b.niche=? AND b.location=? AND e.tier='risky'""",
+                (niche, location),
+            ).fetchone()[0]
+            unverified = conn.execute(
+                """SELECT COUNT(*) FROM emails e JOIN businesses b ON b.id=e.business_id
+                   WHERE b.niche=? AND b.location=? AND e.tier='unverified'""",
                 (niche, location),
             ).fetchone()[0]
 
         click.echo(
             f"\n=== FUNNEL SUMMARY ===\n"
-            f"  Discovered businesses : {total_biz}\n"
-            f"  Acceptable emails     : {acceptable}\n"
-            f"  Risky emails          : {risky}\n"
+            f"  Businesses discovered     : {total}\n"
+            f"  With website              : {with_site}\n"
+            f"  Without website           : {no_site}\n"
+            f"  Blocked (403)             : {blocked}\n"
+            f"  Temp failed (retry next)  : {temp_failed}\n"
+            f"  Emails found (raw)        : {emails_raw}\n"
+            f"  Acceptable tier           : {acceptable}\n"
+            f"  Risky tier                : {risky}\n"
+            f"  Unverified (DNS error)    : {unverified}\n"
         )
 
 

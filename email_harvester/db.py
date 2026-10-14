@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS businesses (
     niche            TEXT    NOT NULL,
     location         TEXT    NOT NULL,
     business_name    TEXT    NOT NULL,
-    website_url      TEXT,                   -- raw URL from directory
+    website_url      TEXT,                   -- the business's OWN site (only set if the directory showed one)
+    listing_url      TEXT,                   -- the directory's own result/profile page for this business
     normalized_url   TEXT,                   -- cleaned URL after RESOLVE stage
     phone            TEXT,
     address          TEXT,
@@ -25,7 +26,9 @@ CREATE TABLE IF NOT EXISTS businesses (
     source           TEXT    NOT NULL,       -- yellowpages | bing | yelp
     discovered_at    TEXT    DEFAULT (datetime('now')),
     resolve_status   TEXT    DEFAULT 'pending',  -- pending | done | no_site | failed
-    crawl_status     TEXT    DEFAULT 'pending',  -- pending | done | failed | no_emails_static
+    -- pending | done | no_emails | blocked | temp_failed | invalid_url — see crawl.py's module docstring
+    crawl_status     TEXT    DEFAULT 'pending',
+    crawl_error      TEXT,                   -- HTTP code or exception message behind a non-done/no_emails status
     playwright_tried INTEGER DEFAULT 0,
     facebook_url     TEXT,
     instagram_url    TEXT,
@@ -45,9 +48,9 @@ CREATE TABLE IF NOT EXISTS emails (
     is_disposable   INTEGER,
     is_role         INTEGER,
     is_freemail     INTEGER,
-    mx_status       TEXT,   -- acceptable | risky | invalid | error
-    tier            TEXT,   -- acceptable | risky | invalid
-    verified_at     TEXT,
+    mx_status       TEXT,   -- acceptable | risky | invalid | dns_error
+    tier            TEXT,   -- acceptable | risky | invalid | unverified
+    verified_at     TEXT,   -- left NULL for 'unverified' rows so VERIFY retries them next run
     UNIQUE(business_id, email)
 );
 
@@ -68,6 +71,17 @@ _BUSINESS_COLUMN_MIGRATIONS: dict[str, str] = {
     "linkedin_url":  "ALTER TABLE businesses ADD COLUMN linkedin_url TEXT",
     "social_status": "ALTER TABLE businesses ADD COLUMN social_status TEXT DEFAULT 'pending'",
     "relevance_checked": "ALTER TABLE businesses ADD COLUMN relevance_checked INTEGER DEFAULT 1",
+    # listing_url = the directory result page for this business (e.g. a
+    # Yelp /biz/... or BBB profile URL); website_url = the business's own
+    # site, only ever set when the directory actually showed one. Keeping
+    # these separate stops a listing URL from being crawled as if it were
+    # the business's real site.
+    "listing_url": "ALTER TABLE businesses ADD COLUMN listing_url TEXT",
+    # crawl_error holds the specific reason behind a non-'done'/'no_emails'
+    # crawl_status (an HTTP code, or an exception message) — see crawl.py's
+    # module docstring for the full set of crawl_status values this pairs
+    # with.
+    "crawl_error": "ALTER TABLE businesses ADD COLUMN crawl_error TEXT",
 }
 
 
@@ -124,6 +138,7 @@ def upsert_business(
     location: str,
     business_name: str,
     website_url: str | None,
+    listing_url: str | None = None,
     phone: str | None,
     address: str | None,
     category: str | None,
@@ -134,11 +149,11 @@ def upsert_business(
     conn.execute(
         """
         INSERT OR IGNORE INTO businesses
-            (niche, location, business_name, website_url, phone, address, category,
+            (niche, location, business_name, website_url, listing_url, phone, address, category,
              source, relevance_checked)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (niche, location, business_name, website_url, phone, address, category,
+        (niche, location, business_name, website_url, listing_url, phone, address, category,
          source, int(relevance_checked)),
     )
     row = conn.execute(

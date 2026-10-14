@@ -1,0 +1,14 @@
+# Email Harvester — Campaign Configuration Example
+# Copy this file and edit for your campaign.
+# CLI flags override these values when both are provided.
+
+niche: "plumbers"
+location: "Austin, TX"
+max: 200
+db: "runs/plumbers_austin.db"
+out: "exports/plumbers_austin.xlsx"
+suppress: "suppression_list.csv"
+browser: true
+api_fallback: false
+stage: "all"
+# proxy_pool: "http://user:pass@host:port"  # or set PROXY_POOL env var

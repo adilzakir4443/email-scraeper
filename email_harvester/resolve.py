@@ -206,6 +206,8 @@ def _search_website_via_bing(business_name: str, location: str) -> Optional[str]
 
 def run_resolve(
     db_path: str,
+    niche: str | None = None,
+    location: str | None = None,
     api_fallback: bool = False,
     google_api_key: str | None = None,
     google_cx: str | None = None,
@@ -213,6 +215,12 @@ def run_resolve(
     """
     Stage 2: normalise all pending website URLs.
     Already-resolved rows are skipped automatically.
+
+    niche/location restrict this to one campaign's businesses — without
+    them, running e.g. "plumbers, Austin, TX" would also resolve a
+    "dentists, London" batch sitting pending in the same database. A plain
+    `? IS NULL OR column=?` pair for each, so the default (both None)
+    resolves everything pending, same as before this parameter existed.
 
     If the Bing search-fallback above finds nothing AND api_fallback is set
     AND Google API keys are configured, a Google Custom Search Engine query
@@ -229,8 +237,13 @@ def run_resolve(
     # start); anything not found is marked no_site.
     with get_conn(db_path) as conn:
         no_site_candidates = conn.execute(
-            "SELECT id, business_name, location FROM businesses "
-            "WHERE website_url IS NULL AND resolve_status='pending'"
+            """
+            SELECT id, business_name, location FROM businesses
+            WHERE website_url IS NULL AND resolve_status='pending'
+              AND (? IS NULL OR niche=?)
+              AND (? IS NULL OR location=?)
+            """,
+            (niche, niche, location, location),
         ).fetchall()
 
     if no_site_candidates:
@@ -243,13 +256,16 @@ def run_resolve(
     for row in no_site_candidates:
         biz_id = row["id"]
         name = row["business_name"]
-        location = row["location"]
+        # Deliberately NOT named `location` — that would shadow this
+        # function's own `location` parameter for the rest of run_resolve,
+        # corrupting the niche/location filter on the second query below.
+        biz_location = row["location"]
 
-        found_url = _search_website_via_bing(name, location)
+        found_url = _search_website_via_bing(name, biz_location)
 
         if found_url is None and api_fallback and google_api_key and google_cx:
             from .google_api import find_website_via_cse
-            found_url = find_website_via_cse(name, location, google_api_key, google_cx)
+            found_url = find_website_via_cse(name, biz_location, google_api_key, google_cx)
 
         with get_conn(db_path) as conn:
             if found_url:
@@ -270,7 +286,13 @@ def run_resolve(
 
     with get_conn(db_path) as conn:
         rows = conn.execute(
-            "SELECT id, website_url FROM businesses WHERE resolve_status='pending'"
+            """
+            SELECT id, website_url FROM businesses
+            WHERE resolve_status='pending'
+              AND (? IS NULL OR niche=?)
+              AND (? IS NULL OR location=?)
+            """,
+            (niche, niche, location, location),
         ).fetchall()
 
     total = len(rows)

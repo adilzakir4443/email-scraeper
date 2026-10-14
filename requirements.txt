@@ -13,3 +13,4 @@ fake-useragent==1.5.1
 python-dotenv==1.0.1
 disposable-email-domains==0.0.94
 tldextract==5.1.2
+pyyaml>=6.0

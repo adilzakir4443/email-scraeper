@@ -112,10 +112,10 @@ def _mx_lookup_with(domain: str, resolver: dns.resolver.Resolver) -> str:
         return "invalid"
     except dns.exception.Timeout:
         logger.debug("DNS timeout for %s", domain)
-        return "error"
+        return "dns_error"
     except Exception as exc:
         logger.debug("MX lookup error for %s: %s", domain, exc)
-        return "error"
+        return "dns_error"
 
 
 def _mx_lookup(domain: str) -> str:
@@ -123,14 +123,14 @@ def _mx_lookup(domain: str) -> str:
     Check MX records. Returns:
       'acceptable' — valid MX found
       'invalid'    — no MX records (DNS NXDOMAIN, NoAnswer)
-      'error'      — DNS lookup failed on both the system resolver and the
+      'dns_error'  — DNS lookup failed on both the system resolver and the
                      public-DNS fallback (don't reject permanently)
     """
     if domain in _mx_cache:
         return _mx_cache[domain]
 
     status = _mx_lookup_with(domain, _RESOLVER)
-    if status == "error":
+    if status == "dns_error":
         logger.debug("System resolver failed for %s; retrying via public DNS", domain)
         status = _mx_lookup_with(domain, _FALLBACK_RESOLVER)
 
@@ -158,22 +158,33 @@ def _compute_tier(
     return "acceptable"
 
 
-def run_verify(db_path: str) -> None:
+def run_verify(db_path: str, niche: str | None = None, location: str | None = None) -> None:
     """
     Stage 4a: verify all emails not yet verified.
     Updates syntax_valid, is_disposable, is_role, is_freemail, mx_status, tier, verified_at.
+
+    niche/location restrict this to one campaign's businesses — a plain
+    `? IS NULL OR column=?` pair for each, so the default (both None)
+    verifies everything pending, same as before this parameter existed.
     """
     logger.info("=== STAGE 4a: VERIFY ===")
 
     with get_conn(db_path) as conn:
         rows = conn.execute(
-            "SELECT id, email FROM emails WHERE verified_at IS NULL"
+            """
+            SELECT e.id, e.email FROM emails e
+            JOIN businesses b ON b.id = e.business_id
+            WHERE e.verified_at IS NULL
+              AND (? IS NULL OR b.niche = ?)
+              AND (? IS NULL OR b.location = ?)
+            """,
+            (niche, niche, location, location),
         ).fetchall()
 
     total = len(rows)
     logger.info("[VERIFY] %d emails to verify", total)
 
-    counts: dict[str, int] = {"acceptable": 0, "risky": 0, "invalid": 0, "error": 0}
+    counts: dict[str, int] = {"acceptable": 0, "risky": 0, "invalid": 0, "unverified": 0}
 
     for row in rows:
         email_id: int = row["id"]
@@ -198,20 +209,23 @@ def run_verify(db_path: str) -> None:
         freemail = _is_freemail(domain)
         mx = _mx_lookup(domain) if syntax_ok and not disposable else "invalid"
 
-        if mx == "error":
-            # Transient DNS failure — record the check results but leave
-            # verified_at NULL so this row is retried on the next run instead
-            # of permanently defaulting to "acceptable" (a lookup that never
-            # completed is not the same as one that passed).
+        if mx == "dns_error":
+            # Transient DNS failure — record the check results and tier as
+            # 'unverified' (so WRITE can still list this email somewhere —
+            # see write.py's Sheet 3 query — instead of it vanishing from
+            # every sheet with a NULL tier), but deliberately leave
+            # verified_at NULL so this row is retried on the next run
+            # instead of being stuck here permanently (a lookup that never
+            # completed is not the same as one that passed or failed).
             with get_conn(db_path) as conn:
                 conn.execute(
                     """UPDATE emails
                        SET syntax_valid=?, is_disposable=?, is_role=?, is_freemail=?,
-                           mx_status=?
+                           mx_status=?, tier='unverified'
                        WHERE id=?""",
                     (int(syntax_ok), int(disposable), int(role), int(freemail), mx, email_id),
                 )
-            counts["error"] += 1
+            counts["unverified"] += 1
             continue
 
         tier = _compute_tier(
@@ -239,5 +253,5 @@ def run_verify(db_path: str) -> None:
 
     logger.info(
         "[VERIFY] DONE — acceptable=%d  risky=%d  invalid=%d  dns_error=%d  total=%d",
-        counts["acceptable"], counts["risky"], counts["invalid"], counts["error"], total,
+        counts["acceptable"], counts["risky"], counts["invalid"], counts["unverified"], total,
     )

@@ -165,7 +165,7 @@ def _get_crawl_result(website: str, cache: dict) -> tuple[list[dict], dict]:
     """
     if website not in cache:
         try:
-            emails, _pages, social_links = _crawl_site_static(website)
+            emails, _pages, social_links, _status, _error = _crawl_site_static(website)
         except Exception as exc:
             logger.debug("[ENRICH] Crawl failed for %s: %s", website, exc)
             emails, social_links = [], {}

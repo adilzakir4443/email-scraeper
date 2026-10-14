@@ -7,7 +7,15 @@ For each resolved site:
   3. If zero emails found statically → retry ONCE with Playwright Chromium
   4. Store extracted emails in the emails table
 
-Resumable: crawl_status tracks done/failed/no_emails_static/pending.
+Resumable: crawl_status is one of:
+  pending     — not yet attempted
+  done        — crawled successfully, emails found
+  no_emails   — crawled successfully, zero emails found anywhere on the site
+  blocked     — HTTP 403/429 persisted through retries — not retried again
+  temp_failed — connection error/timeout — retried on the next run
+  invalid_url — HTTP 404/410/other non-200 — not retried again
+crawl_error holds the specific reason (an HTTP code or exception message)
+behind a blocked/temp_failed/invalid_url status.
 Politeness: 3–8s random delay between sites; 2–3 concurrent workers (sync here).
 """
 
@@ -99,29 +107,45 @@ def _absolute(href: str, base_url: str) -> str | None:
         return None
 
 
-def _fetch_page(client: httpx.Client, url: str, proxy: str | None = None) -> Optional[str]:
-    """Fetch a single page and return its HTML, or None on error."""
+def _fetch_page(
+    client: httpx.Client, url: str, proxy: str | None = None,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Fetch a single page. Returns (html, status, error):
+      - success                          : (html_text, None, None)
+      - 403/429/407 persisted thru retries: (None, "blocked", "HTTP <code>")
+      - connection error/timeout persisted : (None, "temp_failed", str(exc))
+      - any other non-200 (404/410/etc.)  : (None, "invalid_url", "HTTP <code>")
+    status/error are only meaningful to the caller for the homepage fetch —
+    see _crawl_site_static's docstring; a sub-page failure is routine
+    (every site has some dead links) and callers looping over sub-pages
+    just check html is None, same as before this returned extra detail.
+    """
     pool = get_pool()
+    last_status: Optional[str] = None
+    last_error: Optional[str] = None
     for attempt in range(3):
         try:
             resp = client.get(url)
             if resp.status_code == 407:
                 pool.mark_407(proxy)
                 logger.warning("407 Proxy Auth failed for %s — check proxy credentials", url)
-                return None  # don't retry 407 — it won't fix itself with the same proxy
+                return None, "blocked", "HTTP 407"  # don't retry — won't fix itself with the same proxy
             if resp.status_code in (403, 429):
                 logger.warning("HTTP %d for %s (attempt %d)", resp.status_code, url, attempt)
+                last_status, last_error = "blocked", f"HTTP {resp.status_code}"
                 pool.backoff_sleep(attempt + 1)
                 continue
             if resp.status_code == 200:
-                return resp.text
+                return resp.text, None, None
             # 404/410 etc — page doesn't exist, stop trying
             logger.debug("HTTP %d for %s — skipping", resp.status_code, url)
-            return None
+            return None, "invalid_url", f"HTTP {resp.status_code}"
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
             logger.debug("Fetch error %s: %s (attempt %d)", url, exc, attempt)
+            last_status, last_error = "temp_failed", str(exc)
             pool.backoff_sleep(attempt + 1)
-    return None
+    return None, last_status, last_error
 
 
 def _discover_contact_links(html: str, base_url: str) -> list[str]:
@@ -142,12 +166,25 @@ def _discover_contact_links(html: str, base_url: str) -> list[str]:
     return links[:MAX_PAGES_PER_SITE]
 
 
-def _crawl_site_static(base_url: str) -> tuple[list[dict], list[str], dict]:
+def _crawl_site_static(
+    base_url: str,
+) -> tuple[list[dict], list[str], dict, Optional[str], Optional[str]]:
     """
     Fetch homepage + standard paths + discovered contact links.
-    Returns (emails_list, pages_visited, social_links).
+    Returns (emails_list, pages_visited, social_links, failure_status, failure_error).
     social_links is {"facebook": url|None, "instagram": url|None, "linkedin": url|None},
     merged across every page visited (first match per platform wins).
+
+    failure_status/failure_error are both None on any success — including
+    a homepage that loaded fine but ultimately yielded zero emails, which
+    is run_crawl()'s job to classify as 'no_emails', not this function's.
+    They're only set when the homepage itself could never be fetched at
+    all, classifying why: 'blocked' (403/429/407 persisted through
+    retries), 'temp_failed' (connection error/timeout persisted through
+    retries), or 'invalid_url' (404/410/other non-200). A sub-page that
+    fails after a successful homepage doesn't affect this — every real
+    site has some dead internal links, and the homepage already proved
+    the site itself is reachable.
 
     Tries a direct (no-proxy) connection first — a proxy from the pool is
     only spent if the direct attempt comes back with nothing at all
@@ -170,26 +207,35 @@ def _crawl_site_static(base_url: str) -> tuple[list[dict], list[str], dict]:
 
     # Homepage: try direct first, fall back to proxy only if direct found
     # nothing. dict.fromkeys dedupes the no-proxies-configured case
-    # (proxy is already None) so direct isn't attempted twice.
+    # (proxy is already None) so direct isn't attempted twice. Keeps the
+    # LAST candidate's status/error — if both direct and proxy fail, the
+    # proxy attempt's classification is the more informative one to report
+    # (direct failing is often just "no proxy configured" background noise).
     html: Optional[str] = None
     used_proxy: str | None = None
+    failure_status: Optional[str] = None
+    failure_error: Optional[str] = None
     for attempt_proxy in dict.fromkeys([None, proxy]):
         try:
             with _make_client(attempt_proxy) as client:
-                attempt_html = _fetch_page(client, base_url, proxy=attempt_proxy)
+                attempt_html, attempt_status, attempt_error = _fetch_page(
+                    client, base_url, proxy=attempt_proxy
+                )
         except Exception as exc:
             logger.debug(
                 "[CRAWL] %s connection failed for %s: %s",
                 "Direct" if attempt_proxy is None else "Proxy", base_url, exc,
             )
+            failure_status, failure_error = "temp_failed", str(exc)
             continue
         if attempt_html:
             html = attempt_html
             used_proxy = attempt_proxy
             break
+        failure_status, failure_error = attempt_status, attempt_error
 
     if html is None:
-        return [], [], social
+        return [], [], social, failure_status, failure_error
 
     logger.debug("[CRAWL] %s — using %s", base_url, "proxy" if used_proxy else "direct")
 
@@ -218,11 +264,14 @@ def _crawl_site_static(base_url: str) -> tuple[list[dict], list[str], dict]:
             seen_paths.add(url)
 
     # Visit each sub-page, reusing whichever connection (direct or proxy)
-    # the homepage fetch already proved works for this site.
+    # the homepage fetch already proved works for this site. A sub-page's
+    # own status/error is intentionally discarded — a dead /contact link
+    # doesn't make the whole site 'blocked' or 'invalid_url' when the
+    # homepage itself loaded fine.
     with _make_client(used_proxy) as client:
         for page_url in to_visit[:MAX_PAGES_PER_SITE]:
             time.sleep(random.uniform(0.5, 1.5))  # intra-site politeness
-            sub_html = _fetch_page(client, page_url, proxy=used_proxy)
+            sub_html, _sub_status, _sub_error = _fetch_page(client, page_url, proxy=used_proxy)
             if sub_html is None:
                 continue
             pages_visited.append(page_url)
@@ -230,7 +279,7 @@ def _crawl_site_static(base_url: str) -> tuple[list[dict], list[str], dict]:
                 all_emails.setdefault(item["email"], item | {"source_url": page_url})
             _merge_social(sub_html)
 
-    return list(all_emails.values()), pages_visited, social
+    return list(all_emails.values()), pages_visited, social, None, None
 
 
 def _crawl_site_playwright(base_url: str) -> tuple[list[dict], dict]:
@@ -292,10 +341,21 @@ def _crawl_site_playwright(base_url: str) -> tuple[list[dict], dict]:
         return [], {"facebook": None, "instagram": None, "linkedin": None}
 
 
-def run_crawl(db_path: str) -> None:
+def run_crawl(db_path: str, niche: str | None = None, location: str | None = None) -> None:
     """
     Stage 3: crawl all resolved sites and extract emails.
-    Skips businesses whose crawl_status is not 'pending'.
+
+    Processes businesses whose crawl_status is 'pending' or 'temp_failed' —
+    the latter is a transient connection error/timeout from a previous run,
+    worth retrying. 'blocked' (403/429 persisted through retries) and
+    'invalid_url' (404/410) are deliberately excluded: retrying either
+    wastes time, since neither fixes itself on a plain re-request the way
+    a transient network error might.
+
+    niche/location restrict this to one campaign's businesses — a plain
+    `? IS NULL OR column=?` pair for each, so the default (both None)
+    crawls everything pending/temp_failed, same as before this parameter
+    existed.
     """
     logger.info("=== STAGE 3: CRAWL + EXTRACT ===")
 
@@ -305,15 +365,19 @@ def run_crawl(db_path: str) -> None:
             SELECT id, normalized_url, website_url
             FROM businesses
             WHERE resolve_status IN ('done','failed')
-              AND crawl_status = 'pending'
+              AND crawl_status IN ('pending', 'temp_failed')
               AND (normalized_url IS NOT NULL OR website_url IS NOT NULL)
-            """
+              AND (? IS NULL OR niche=?)
+              AND (? IS NULL OR location=?)
+            """,
+            (niche, niche, location, location),
         ).fetchall()
 
     total = len(rows)
     logger.info("[CRAWL] %d sites to crawl", total)
 
-    crawled = failed = emails_found = playwright_fallbacks = 0
+    crawled = emails_found = playwright_fallbacks = 0
+    status_counts: dict[str, int] = {}
 
     for i, row in enumerate(rows, 1):
         biz_id: int = row["id"]
@@ -322,18 +386,23 @@ def run_crawl(db_path: str) -> None:
         logger.info("[CRAWL] (%d/%d) %s", i, total, site_url)
 
         try:
-            emails, pages, social = _crawl_site_static(site_url)
+            emails, pages, social, failure_status, failure_error = _crawl_site_static(site_url)
         except Exception as exc:
+            # Unexpected, unclassified failure — treat as temp_failed
+            # (worth retrying) rather than a permanent block, since nothing
+            # here actually diagnosed it as one.
             logger.error("[CRAWL] Unhandled error for %s: %s", site_url, exc)
             with get_conn(db_path) as conn:
                 conn.execute(
-                    "UPDATE businesses SET crawl_status='failed' WHERE id=?", (biz_id,)
+                    "UPDATE businesses SET crawl_status='temp_failed', crawl_error=? WHERE id=?",
+                    (str(exc), biz_id),
                 )
-            failed += 1
+            status_counts["temp_failed"] = status_counts.get("temp_failed", 0) + 1
             time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
             continue
 
-        # If static crawl returned nothing, try Playwright once
+        # If static crawl returned nothing, try Playwright once — a real
+        # browser session can sometimes get past a 403 plain httpx can't.
         if not emails:
             logger.info("[CRAWL] Zero emails static for %s — trying Playwright", site_url)
             playwright_fallbacks += 1
@@ -341,9 +410,27 @@ def run_crawl(db_path: str) -> None:
             for key, value in pw_social.items():
                 if not social.get(key) and value:
                     social[key] = value
-            crawl_status = "done" if emails else "no_emails_static"
+
+        if emails:
+            crawl_status, crawl_error = "done", None
+        elif failure_status:
+            # The homepage itself was never reachable, even after the
+            # Playwright retry above — keep the specific reason
+            # _crawl_site_static already diagnosed, rather than flattening
+            # it to a generic "no emails".
+            crawl_status, crawl_error = failure_status, failure_error
         else:
-            crawl_status = "done"
+            # Homepage loaded fine (by either path) but genuinely has no
+            # email anywhere — a real "nothing to find", not a
+            # connectivity problem.
+            crawl_status, crawl_error = "no_emails", None
+
+        if crawl_status == "blocked":
+            logger.warning("[CRAWL] %s → blocked (%s) — skipping future retries", site_url, crawl_error)
+        elif crawl_status == "temp_failed":
+            logger.warning("[CRAWL] %s → temp_failed — will retry next run", site_url)
+        elif crawl_status == "invalid_url":
+            logger.warning("[CRAWL] %s → invalid_url (%s)", site_url, crawl_error)
 
         # Persist emails
         for item in emails:
@@ -358,8 +445,8 @@ def run_crawl(db_path: str) -> None:
 
         with get_conn(db_path) as conn:
             conn.execute(
-                "UPDATE businesses SET crawl_status=? WHERE id=?",
-                (crawl_status, biz_id),
+                "UPDATE businesses SET crawl_status=?, crawl_error=? WHERE id=?",
+                (crawl_status, crawl_error, biz_id),
             )
 
         # Opportunistically save any social links found while we already had
@@ -374,6 +461,7 @@ def run_crawl(db_path: str) -> None:
                     linkedin_url=social.get("linkedin"),
                 )
 
+        status_counts[crawl_status] = status_counts.get(crawl_status, 0) + 1
         emails_found += len(emails)
         crawled += 1
         logger.info(
@@ -384,6 +472,13 @@ def run_crawl(db_path: str) -> None:
         time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
     logger.info(
-        "[CRAWL] DONE — crawled=%d  failed=%d  emails_raw=%d  playwright_fallbacks=%d",
-        crawled, failed, emails_found, playwright_fallbacks,
+        "[CRAWL] DONE — crawled=%d  done=%d  no_emails=%d  blocked=%d  temp_failed=%d  "
+        "invalid_url=%d  emails_raw=%d  playwright_fallbacks=%d",
+        crawled,
+        status_counts.get("done", 0),
+        status_counts.get("no_emails", 0),
+        status_counts.get("blocked", 0),
+        status_counts.get("temp_failed", 0),
+        status_counts.get("invalid_url", 0),
+        emails_found, playwright_fallbacks,
     )

@@ -109,10 +109,19 @@ def _fetch_with_retry(
 def _parse_yp_listing(card) -> dict | None:
     """Parse a single YP result card into a business dict."""
     try:
-        name_tag = card.select_one("a.business-name span")
-        name = name_tag.get_text(strip=True) if name_tag else None
-        if not name:
+        name_tag = card.select_one("a.business-name")
+        name_text = name_tag.get_text(strip=True) if name_tag else None
+        if not name_text:
             return None
+        # listing_url = this card's own YellowPages detail page — the SAME
+        # anchor the name is read from, not the "Visit Website" link below.
+        # Conflating the two is exactly the bug GAP 2 fixes: a listing URL
+        # stored as if it were the business's own site corrupts CRAWL (it
+        # crawls YellowPages' own page, not the business's).
+        listing_url = (
+            urllib.parse.urljoin("https://www.yellowpages.com", name_tag["href"])
+            if name_tag.get("href") else None
+        )
 
         website_tag = card.select_one("a.track-visit-website")
         website = website_tag.get("href") if website_tag else None
@@ -133,8 +142,9 @@ def _parse_yp_listing(card) -> dict | None:
         category = cat_tag.get_text(strip=True) if cat_tag else None
 
         return {
-            "business_name": name,
+            "business_name": name_text,
             "website_url": website,
+            "listing_url": listing_url,
             "phone": phone,
             "address": address,
             "category": category,
@@ -267,6 +277,10 @@ def _scrape_bing(niche: str, location: str, max_results: int) -> Iterator[dict]:
             biz = _parse_bing_listing(card)
             if biz:
                 biz["source"] = "bing"
+                # Bing Maps has no per-business detail-page URL in the
+                # response — the search results page itself is the closest
+                # thing to a "listing" for these.
+                biz["listing_url"] = url
                 yield biz
                 collected += 1
                 if collected >= max_results:
@@ -302,7 +316,14 @@ def _parse_yelp_listing(card) -> dict | None:
         # Yelp's contact info/tracking links, not the business's), and the
         # WRITE stage's "No Website" sheet would wrongly treat every Yelp
         # business as having a site, hiding it from that sheet even when it
-        # truly has none.
+        # truly has none. That /biz/... link is still useful, just under a
+        # different name — listing_url, Yelp's own result page for this
+        # business, kept separate from website_url for exactly that reason.
+        biz_link = card.select_one("a[href*='/biz/']")
+        listing_url = (
+            urllib.parse.urljoin("https://www.yelp.com", biz_link["href"]) if biz_link else None
+        )
+
         phone_tag = card.select_one("p[class*='phone']") or card.find("p", string=re.compile(r"\(\d{3}\)"))
         phone = phone_tag.get_text(strip=True) if phone_tag else None
 
@@ -315,6 +336,7 @@ def _parse_yelp_listing(card) -> dict | None:
         return {
             "business_name": name,
             "website_url": None,   # not discoverable from the Yelp search card
+            "listing_url": listing_url,
             "phone": phone,
             "address": address,
             "category": category,
@@ -511,6 +533,10 @@ def _scrape_google_maps(niche: str, location: str, max_results: int) -> Iterator
                             continue
                         seen_names.add(biz["business_name"])
                         biz["source"] = "google_maps"
+                        # Google Maps has no stable per-business detail-page
+                        # URL captured here — the search results page itself
+                        # is the closest thing to a "listing" for these.
+                        biz["listing_url"] = url
                         results.append(biz)
                         if len(results) >= max_results:
                             return results
@@ -637,6 +663,11 @@ def _save_debug_html(page, path: str, source_label: str) -> None:
 
 _YP_CARD_SELECTOR = "div.result, div.v-card"
 _YP_NAME_SELECTORS = ["a.business-name > span", "h2.n > a"]
+# Same two card variants as _YP_NAME_SELECTORS, but pointing at the anchor
+# itself (for its href) rather than the text-bearing child — this card's
+# own YellowPages detail page, kept as listing_url rather than confused
+# with website_url (the "Visit Website" link, a different element below).
+_YP_LISTING_SELECTORS = ["a.business-name", "h2.n > a"]
 _YP_PHONE_SELECTORS = ["div.phones.phone.primary", "p.phone"]
 _YP_STREET_SELECTORS = ["span.street-address"]
 _YP_LOCALITY_SELECTORS = ["span.locality"]
@@ -707,9 +738,14 @@ def _scrape_yellowpages_browser(
                     locality = _try_selectors(card, _YP_LOCALITY_SELECTORS)
                     address = ", ".join(p for p in (street, locality) if p) or None
 
+                    listing_href = _try_selector_attr(card, _YP_LISTING_SELECTORS, "href")
                     biz = {
                         "business_name": name,
                         "website_url": _try_selector_attr(card, _YP_WEBSITE_SELECTORS, "href") or None,
+                        "listing_url": (
+                            urllib.parse.urljoin("https://www.yellowpages.com", listing_href)
+                            if listing_href else None
+                        ),
                         "phone": _try_selectors(card, _YP_PHONE_SELECTORS) or None,
                         "address": address,
                         "category": _try_selectors(card, _YP_CATEGORY_SELECTORS) or None,
@@ -1002,6 +1038,11 @@ _BBB_WEBSITE_SELECTORS = [
     'a[data-testid="biz-website"]',
     'a[href*="http"]:not([href*="bbb.org"])',
 ]
+# This card's own BBB profile page — confirmed real markup: the anchor
+# inside h3.result-business-name (same element _BBB_NAME_SELECTORS reads
+# the name's inner_text() from), e.g. "/us/tx/austin/profile/plumber/...".
+# Kept as listing_url, never conflated with website_url above.
+_BBB_LISTING_SELECTORS = ["h3.result-business-name a", 'span[itemprop="name"] ~ a', "h3.MuiTypography-h3 a"]
 # Sponsored/ad listings (confirmed live) render an "advertisement:" label
 # as part of the same heading inner_text() reads the name from, e.g.
 # "advertisement:\nAbacus Plumbing, Air Conditioning & Electrical" — strip
@@ -1073,9 +1114,14 @@ def _scrape_bbb_browser(
                     locality = _try_selectors(card, _BBB_LOCALITY_SELECTORS)
                     address = ", ".join(p for p in (street, locality) if p)
 
+                listing_href = _try_selector_attr(card, _BBB_LISTING_SELECTORS, "href")
                 biz = {
                     "business_name": name,
                     "website_url": _try_selector_attr(card, _BBB_WEBSITE_SELECTORS, "href") or None,
+                    "listing_url": (
+                        urllib.parse.urljoin("https://www.bbb.org", listing_href)
+                        if listing_href else None
+                    ),
                     "phone": phone or None,
                     "address": address or None,
                     "category": _try_selectors(card, _BBB_CATEGORY_SELECTORS) or None,
@@ -1123,6 +1169,10 @@ _MANTA_NAME_SELECTORS = ["h2.company-name > a", 'a[data-cy="company-name"]']
 _MANTA_PHONE_SELECTORS = ["span.phone", 'div[data-cy="phone"]']
 _MANTA_ADDRESS_SELECTORS = ["span.address", 'div[data-cy="address"]']
 _MANTA_WEBSITE_SELECTORS = ['a[data-cy="website"]', "a.website-link"]
+# Both _MANTA_NAME_SELECTORS entries are themselves anchors (not a separate
+# text-bearing child, unlike YP/BBB above), so the same selectors work for
+# this card's own Manta profile page — just reading href instead of text.
+_MANTA_LISTING_SELECTORS = _MANTA_NAME_SELECTORS
 
 
 def _scrape_manta_browser(
@@ -1174,9 +1224,14 @@ def _scrape_manta_browser(
                     continue
                 seen_names.add(name)
 
+                listing_href = _try_selector_attr(card, _MANTA_LISTING_SELECTORS, "href")
                 biz = {
                     "business_name": name,
                     "website_url": _try_selector_attr(card, _MANTA_WEBSITE_SELECTORS, "href") or None,
+                    "listing_url": (
+                        urllib.parse.urljoin("https://www.manta.com", listing_href)
+                        if listing_href else None
+                    ),
                     "phone": _try_selectors(card, _MANTA_PHONE_SELECTORS) or None,
                     "address": _try_selectors(card, _MANTA_ADDRESS_SELECTORS) or None,
                     "category": None,
@@ -1728,6 +1783,7 @@ def run_discover(
                         location=location,
                         business_name=biz["business_name"],
                         website_url=biz.get("website_url"),
+                        listing_url=biz.get("listing_url"),
                         phone=biz.get("phone"),
                         address=biz.get("address"),
                         category=biz.get("category"),
@@ -1795,6 +1851,7 @@ def run_discover(
                         location=location,
                         business_name=biz["business_name"],
                         website_url=biz.get("website_url"),
+                        listing_url=biz.get("listing_url"),
                         phone=biz.get("phone"),
                         address=biz.get("address"),
                         category=biz.get("category"),
